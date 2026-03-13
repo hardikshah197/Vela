@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  vela:
+    build: .
+    container_name: vela
+    ports:
+      - "3001:3001"
+      - "5173:5173"
+    volumes:
+      # Mount your project directories
+      - ${HOME}/Desktop:/workspace
+      # Optional: mount GitHub CLI config for fork/clone features
+      # - ${HOME}/.config/gh:/root/.config/gh:ro
+    environment:
+      - VELA_SEARCH_ROOTS=/workspace
+      - VELA_CLONE_DIR=/workspace/cloned
+      - SHELL=/bin/bash
+      - NODE_ENV=production
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
