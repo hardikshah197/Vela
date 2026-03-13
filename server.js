@@ -1,10 +1,13 @@
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { execSync, exec } from 'child_process';
-import { existsSync, mkdirSync, writeFileSync } from 'fs';
-import { join } from 'path';
+import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'fs';
+import { join, extname } from 'path';
 import { tmpdir } from 'os';
+import { fileURLToPath } from 'url';
 import pty from 'node-pty';
+
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 // --- Config ---
 // Search roots: directories to scan when resolving project names
@@ -333,12 +336,46 @@ function handleAPI(req, res) {
 }
 
 // --- Server setup ---
+const MIME_TYPES = {
+  '.html': 'text/html', '.js': 'application/javascript', '.css': 'text/css',
+  '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png',
+  '.ico': 'image/x-icon', '.woff': 'font/woff', '.woff2': 'font/woff2',
+};
+
+const DIST_DIR = join(__dirname, 'dist');
+
+function serveStatic(req, res) {
+  const url = new URL(req.url, 'http://localhost');
+  let filePath = join(DIST_DIR, url.pathname === '/' ? 'index.html' : url.pathname);
+
+  if (!existsSync(filePath)) {
+    // SPA fallback — serve index.html for unknown routes (but not terminal.html)
+    if (url.pathname.startsWith('/terminal')) {
+      filePath = join(DIST_DIR, 'terminal.html');
+    } else {
+      filePath = join(DIST_DIR, 'index.html');
+    }
+  }
+
+  try {
+    const data = readFileSync(filePath);
+    const ext = extname(filePath);
+    res.writeHead(200, {
+      'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.end(data);
+  } catch {
+    res.writeHead(404);
+    res.end('Not found');
+  }
+}
+
 const server = createServer((req, res) => {
   if (req.url.startsWith('/api/')) {
     handleAPI(req, res);
   } else {
-    res.writeHead(404);
-    res.end();
+    serveStatic(req, res);
   }
 });
 
@@ -541,8 +578,8 @@ function scheduleOrphanCleanup(session, sessionId) {
   }, ORPHAN_TIMEOUT_MS);
 }
 
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`[Vela] Backend running on ws://localhost:${PORT}`);
+  console.log(`[Vela] Running on port ${PORT}`);
   console.log(`[Vela] Search roots: ${SEARCH_ROOTS.join(', ')}`);
 });

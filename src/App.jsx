@@ -220,7 +220,7 @@ const btnStyle = {
   letterSpacing: 0.3,
 };
 
-const API_BASE = window.__VELA_API_BASE__ || "http://localhost:3001";
+const API_BASE = window.__VELA_API_BASE__ || (window.location.port === "5173" ? "http://localhost:3001" : "");
 
 function CreateModal({ onClose, onCreate, settings }) {
   const [name, setName] = useState("");

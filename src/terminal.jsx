@@ -55,7 +55,7 @@ async function uploadFile(file) {
     reader.onload = async () => {
       const base64 = reader.result.split(',')[1];
       try {
-        const apiBase = window.__VELA_API_BASE__ || 'http://localhost:3001';
+        const apiBase = window.__VELA_API_BASE__ || (window.location.port === '5173' ? 'http://localhost:3001' : '');
         const res = await fetch(`${apiBase}/api/upload`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -229,7 +229,8 @@ function TerminalPage() {
       if (disposedRef.current) return;
       setConnStatus(hasConnectedBefore ? 'RECONNECTING' : 'CONNECTING');
 
-      const wsBase = window.__VELA_WS_BASE__ || 'ws://localhost:3001';
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsBase = window.__VELA_WS_BASE__ || (window.location.port === '5173' ? 'ws://localhost:3001' : `${wsProtocol}//${window.location.host}`);
       const wsUrl = `${wsBase}?agent=${agent}&args=${encodeURIComponent(args)}&id=${sessionId}&cwd=${encodeURIComponent(cwd)}`;
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
