@@ -5,20 +5,20 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "start": "node server.js",
-    "server": "node server.js",
+    "start": "./vela-server",
+    "server": "./vela-server",
+    "server:node": "node server.js",
     "build": "vite build",
+    "build:server": "cd server && go build -o ../vela-server .",
+    "build:all": "npm run build && npm run build:server",
     "lint": "eslint .",
-    "preview": "vite preview",
-    "postinstall": "chmod +x node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper 2>/dev/null || chmod +x node_modules/node-pty/prebuilds/linux-x64/spawn-helper 2>/dev/null || true"
+    "preview": "vite preview"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
-    "node-pty": "^1.1.0",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0",
-    "ws": "^8.19.0"
+    "react-dom": "^19.2.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",

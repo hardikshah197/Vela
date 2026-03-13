@@ -1,46 +1,43 @@
-FROM node:20-slim
+# Stage 1: Build Go backend
+FROM golang:1.22-bookworm AS go-builder
+WORKDIR /build
+COPY server/ ./server/
+WORKDIR /build/server
+RUN go mod download && go build -o /vela-server .
 
-# Install build tools for node-pty and git for project resolution
+# Stage 2: Build frontend
+FROM node:20-slim AS frontend-builder
+WORKDIR /build
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY . .
+RUN npx vite build
+
+# Stage 3: Runtime
+FROM debian:bookworm-slim
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    build-essential \
-    python3 \
     git \
     procps \
     lsof \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy package files first for better layer caching
-COPY package.json package-lock.json ./
+# Copy Go binary
+COPY --from=go-builder /vela-server ./vela-server
 
-# Install all dependencies (devDependencies needed for vite build)
-RUN npm ci
+# Copy frontend build
+COPY --from=frontend-builder /build/dist ./dist
 
-# Copy source
-COPY . .
-
-# Build frontend
-RUN npm run build
-
-# Remove devDependencies after build
-RUN npm prune --production
-
-# Expose backend port
 EXPOSE 3001
 
-# Environment defaults
 ENV VELA_SEARCH_ROOTS=/workspace
 ENV VELA_CLONE_DIR=/workspace/cloned
 ENV SHELL=/bin/bash
 ENV NODE_ENV=production
 
-# Create workspace directories
 RUN mkdir -p /workspace/cloned
 
-# Start both backend and static file server
-COPY docker-entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
-
-CMD ["/entrypoint.sh"]
+CMD ["./vela-server"]
