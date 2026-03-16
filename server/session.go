@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -13,7 +12,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
 )
 
@@ -36,6 +34,7 @@ type Session struct {
 	agent          string
 	writeCh        chan []byte // serialized writes to WebSocket
 	doneCh         chan struct{}
+	writeErr       bool // set when WebSocket write fails
 }
 
 func (s *Session) pushScrollback(data string) {
@@ -67,8 +66,8 @@ func (s *Session) kill() {
 func (s *Session) wsSend(data []byte) {
 	select {
 	case s.writeCh <- data:
-	default:
-		// Drop if channel full (back-pressure)
+	case <-time.After(5 * time.Second):
+		log.Printf("[Vela] Write channel full, dropping data (%d bytes)", len(data))
 	}
 }
 
@@ -79,22 +78,49 @@ func (s *Session) wsWriter() {
 		ws := s.ws
 		s.mu.Unlock()
 		if ws != nil {
-			ws.WriteMessage(websocket.TextMessage, data)
+			if err := ws.WriteMessage(websocket.BinaryMessage, data); err != nil {
+				log.Printf("[Vela] WebSocket write error: %v", err)
+				s.mu.Lock()
+				s.writeErr = true
+				s.mu.Unlock()
+				// Drain remaining messages to avoid blocking senders
+				for range s.writeCh {
+				}
+				return
+			}
 		}
 	}
 }
 
 func spawnPTY(command string, args []string, dir string) (*os.File, *exec.Cmd, error) {
-	cmd := exec.Command(command, args...)
-	cmd.Dir = dir
-	cmd.Env = shellEnv
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 30, Cols: 120})
+	master, slave, err := openPTY()
 	if err != nil {
 		return nil, nil, err
 	}
-	return ptmx, cmd, nil
+
+	cmd := exec.Command(command, args...)
+	cmd.Dir = dir
+	cmd.Env = shellEnv
+	cmd.Stdin = slave
+	cmd.Stdout = slave
+	cmd.Stderr = slave
+	// Setsid creates a new session so the PTY becomes the controlling terminal.
+	// NOTE: Do NOT combine Setsid with Setpgid — on macOS Sequoia this triggers
+	// "operation not permitted" for ad-hoc signed binaries.
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid: true,
+		Ctty:   int(slave.Fd()),
+	}
+
+	if err := cmd.Start(); err != nil {
+		master.Close()
+		slave.Close()
+		return nil, nil, err
+	}
+	slave.Close()
+
+	setWinSize(master, 30, 120)
+	return master, cmd, nil
 }
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -140,23 +166,65 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				s.orphanTimer = nil
 			}
 
-			// Swap WebSocket
-			s.ws = conn
-
-			// Signal reconnect
-			conn.WriteMessage(websocket.TextMessage, []byte(`{"__vela":"reconnect"}`))
-
-			// Replay scrollback
-			if len(s.scrollback) > 0 {
-				replay := strings.Join(s.scrollback, "")
-				conn.WriteMessage(websocket.TextMessage, []byte(replay))
+			// Close old WebSocket to force old handleClientMessages to exit cleanly.
+			// This prevents the old defer from racing with us and nulling s.ws.
+			if s.ws != nil {
+				s.ws.Close()
 			}
 
-			ptmx := s.ptyFile
+			// Set new WebSocket
+			s.ws = conn
+
+			// If previous wsWriter exited due to write error, restart it
+			if s.writeErr {
+				s.writeErr = false
+				s.writeCh = make(chan []byte, 4096)
+				go s.wsWriter()
+			} else {
+				// Drain stale data from writeCh to avoid sending old buffered
+				// PTY output before the reconnect signal
+				drained := 0
+			drain:
+				for {
+					select {
+					case <-s.writeCh:
+						drained++
+					default:
+						break drain
+					}
+				}
+				if drained > 0 {
+					log.Printf("[Vela] Drained %d stale messages from writeCh for %s", drained, sessionId)
+				}
+			}
+
+			// Send reconnect signal (wsWriter is blocked waiting on lock we hold,
+			// so these direct writes are safe — no concurrent writers)
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"__vela":"reconnect"}`)); err != nil {
+				log.Printf("[Vela] Failed to send reconnect signal for %s: %v", sessionId, err)
+				s.ws = nil
+				s.mu.Unlock()
+				conn.Close()
+				return
+			}
+
+			// Replay scrollback as BinaryMessage (PTY data may contain invalid UTF-8)
+			if len(s.scrollback) > 0 {
+				replay := strings.Join(s.scrollback, "")
+				if err := conn.WriteMessage(websocket.BinaryMessage, []byte(replay)); err != nil {
+					log.Printf("[Vela] Failed to send scrollback (%d bytes) for %s: %v", len(replay), sessionId, err)
+					s.ws = nil
+					s.mu.Unlock()
+					conn.Close()
+					return
+				}
+			}
+
 			s.mu.Unlock()
 
-			// Start new PTY reader for this connection
-			go readPTYToSession(s, ptmx, sessionId)
+			// Do NOT start another readPTYToSession — the original goroutine
+			// from session creation is still running and feeding writeCh.
+			// Starting duplicates causes goroutine leaks and data races.
 
 			// Handle messages from client
 			handleClientMessages(conn, s, sessionId)
@@ -173,7 +241,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	session := &Session{
 		cwd:     cwd,
 		agent:   agent,
-		writeCh: make(chan []byte, 1024),
+		writeCh: make(chan []byte, 4096),
 		doneCh:  make(chan struct{}),
 	}
 	sessions.Store(sessionId, session)
@@ -189,12 +257,18 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	ptmx, cmd, err := spawnPTY(agent, args, cwd)
 	if err != nil {
 		errMsg := fmt.Sprintf("\r\n\x1b[31mFailed to start %s: %v\x1b[0m\r\n", agent, err)
-		conn.WriteMessage(websocket.TextMessage, []byte(errMsg))
-		conn.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(4000, "spawn_failed"))
-		conn.Close()
-		sessions.Delete(sessionId)
+		session.wsSend([]byte(errMsg))
+		session.wsSend([]byte(`{"__vela":"spawn_failed"}`))
+		time.Sleep(500 * time.Millisecond)
 		close(session.writeCh)
+		session.mu.Lock()
+		if session.ws != nil {
+			session.ws.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(4000, "spawn_failed"))
+			session.ws.Close()
+		}
+		session.mu.Unlock()
+		sessions.Delete(sessionId)
 		return
 	}
 
@@ -203,7 +277,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	session.cmd = cmd
 	session.mu.Unlock()
 
-	// PTY reader goroutine
+	// PTY reader goroutine — only ONE per session, ever
 	go readPTYToSession(session, ptmx, sessionId)
 
 	// Wait for agent exit, then drop to shell
@@ -230,8 +304,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			session.mu.Lock()
 			session.dead = true
 			session.mu.Unlock()
-			endMsg := "\r\n\x1b[90m[Session ended]\x1b[0m\r\n"
-			session.wsSend([]byte(endMsg))
+			session.wsSend([]byte("\r\n\x1b[90m[Session ended]\x1b[0m\r\n"))
 			session.mu.Lock()
 			if session.ws != nil {
 				session.ws.WriteMessage(websocket.CloseMessage,
@@ -247,7 +320,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		session.cmd = shellCmd
 		session.mu.Unlock()
 
-		// Read from new shell PTY
+		// New PTY reader for the shell
 		go readPTYToSession(session, shellPtmx, sessionId)
 
 		// Wait for shell exit
@@ -258,8 +331,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		session.dead = true
 		session.mu.Unlock()
 
-		endMsg := "\r\n\x1b[90m[Session ended]\x1b[0m\r\n"
-		session.wsSend([]byte(endMsg))
+		session.wsSend([]byte("\r\n\x1b[90m[Session ended]\x1b[0m\r\n"))
 
 		session.mu.Lock()
 		if session.ws != nil {
@@ -281,16 +353,16 @@ func readPTYToSession(s *Session, ptmx *os.File, sessionId string) {
 	for {
 		n, err := ptmx.Read(buf)
 		if n > 0 {
-			data := string(buf[:n])
+			// Copy data before sending — buf is reused on next Read
+			chunk := make([]byte, n)
+			copy(chunk, buf[:n])
+
 			s.mu.Lock()
-			s.pushScrollback(data)
+			s.pushScrollback(string(chunk))
 			s.mu.Unlock()
-			s.wsSend(buf[:n])
+			s.wsSend(chunk)
 		}
 		if err != nil {
-			if err != io.EOF {
-				// PTY closed or process exited — expected
-			}
 			return
 		}
 	}
@@ -299,16 +371,26 @@ func readPTYToSession(s *Session, ptmx *os.File, sessionId string) {
 // handleClientMessages reads WebSocket messages and writes to PTY
 func handleClientMessages(conn *websocket.Conn, s *Session, sessionId string) {
 	defer func() {
-		log.Printf("[Vela] Session %s disconnected (will persist)", sessionId)
+		// Only nil out s.ws if WE are still the active connection.
+		// A newer reconnect may have already replaced s.ws — don't clobber it.
 		s.mu.Lock()
-		s.ws = nil
-		s.mu.Unlock()
-		scheduleOrphanCleanup(s, sessionId)
+		if s.ws == conn {
+			log.Printf("[Vela] Session %s disconnected (will persist)", sessionId)
+			s.ws = nil
+			s.mu.Unlock()
+			scheduleOrphanCleanup(s, sessionId)
+		} else {
+			log.Printf("[Vela] Session %s old connection closed (superseded by reconnect)", sessionId)
+			s.mu.Unlock()
+		}
 	}()
 
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
+			if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				log.Printf("[Vela] Session %s read error: %v", sessionId, err)
+			}
 			return
 		}
 
@@ -355,10 +437,7 @@ func handleClientMessages(conn *websocket.Conn, s *Session, sessionId string) {
 				ptmx := s.ptyFile
 				s.mu.Unlock()
 				if ptmx != nil && parsed.Cols > 0 && parsed.Rows > 0 {
-					pty.Setsize(ptmx, &pty.Winsize{
-						Cols: parsed.Cols,
-						Rows: parsed.Rows,
-					})
+					setWinSize(ptmx, parsed.Rows, parsed.Cols)
 				}
 			}
 		} else {

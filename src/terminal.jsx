@@ -243,41 +243,57 @@ function TerminalPage() {
         ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
       };
 
+      ws.binaryType = 'arraybuffer';
+
       ws.onmessage = (e) => {
-        const data = e.data;
+        const raw = e.data;
 
-        // Check for Vela control messages
-        if (data.charAt(0) === '{' && data.includes('"__vela"')) {
-          try {
-            const ctrl = JSON.parse(data);
-            if (ctrl.__vela === 'reconnect') {
-              // Server has authoritative scrollback — reset and let it replay
-              term.reset();
-              resetScrollback();
-              return;
-            }
-            if (ctrl.__vela === 'new_session') {
-              // Server lost old session — keep local scrollback visible
-              // Show a divider so user knows this is a new session
-              if (scrollbackRef.current.length > 0) {
-                const divider = '\r\n\x1b[90m' +
-                  '─'.repeat(60) + '\r\n' +
-                  '  Previous session restored from local cache\r\n' +
-                  '  New agent session started below\r\n' +
-                  '─'.repeat(60) +
-                  '\x1b[0m\r\n\r\n';
-                term.write(divider);
-                appendScrollback(divider);
+        // Text frames (control messages) arrive as strings,
+        // Binary frames (PTY data) arrive as ArrayBuffer
+        if (typeof raw === 'string') {
+          // Text frame — check for Vela control messages
+          if (raw.charAt(0) === '{' && raw.includes('"__vela"')) {
+            try {
+              const ctrl = JSON.parse(raw);
+              if (ctrl.__vela === 'reconnect') {
+                term.reset();
+                resetScrollback();
+                return;
               }
-              return;
+              if (ctrl.__vela === 'spawn_failed') {
+                spawnFailed = true;
+                setConnStatus('SESSION_ENDED');
+                setSessionEnded(true);
+                saveLocalScrollback(scrollbackRef.current);
+                return;
+              }
+              if (ctrl.__vela === 'new_session') {
+                if (scrollbackRef.current.length > 0) {
+                  const divider = '\r\n\x1b[90m' +
+                    '─'.repeat(60) + '\r\n' +
+                    '  Previous session restored from local cache\r\n' +
+                    '  New agent session started below\r\n' +
+                    '─'.repeat(60) +
+                    '\x1b[0m\r\n\r\n';
+                  term.write(divider);
+                  appendScrollback(divider);
+                }
+                return;
+              }
+            } catch {
+              // Not valid JSON — treat as terminal data
             }
-          } catch {
-            // Not valid JSON — fall through to terminal write
           }
+          term.write(raw);
+          appendScrollback(raw);
+        } else {
+          // Binary frame — PTY data, pass directly to xterm as Uint8Array
+          const bytes = new Uint8Array(raw);
+          term.write(bytes);
+          // Store as string for scrollback persistence
+          const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+          appendScrollback(text);
         }
-
-        term.write(data);
-        appendScrollback(data);
       };
 
       ws.onclose = (e) => {
