@@ -1,7 +1,12 @@
 package main
 
 /*
+#if defined(__APPLE__)
 #include <util.h>
+#elif defined(__linux__)
+#include <pty.h>
+#endif
+#cgo linux LDFLAGS: -lutil
 */
 import "C"
 import (
