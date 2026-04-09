@@ -23,34 +23,101 @@ Vela is a workspace manager UI for AI coding agents (Claude Code, OpenAI Codex, 
 
 ---
 
-## Quick Start
+## Installation
 
-### Prerequisites
+Choose the method that works best for you:
 
+| Method | Best for | Command |
+|--------|----------|---------|
+| **Homebrew** | macOS users | `brew tap hardikshah197/tap && brew install vela` |
+| **Docker** | Cross-platform, no local deps | `docker pull ghcr.io/hardikshah197/vela:latest` |
+| **Binary download** | Manual install, no package manager | Download from [Releases](https://github.com/hardikshah197/Vela/releases) |
+| **From source** | Contributors, customization | Clone + build |
+
+### Option 1: Homebrew (macOS — recommended)
+
+```bash
+brew tap hardikshah197/tap
+brew install vela
+```
+
+Start the server:
+```bash
+vela
+```
+
+Open **http://localhost:6100** in your browser. That's it.
+
+Supports both Apple Silicon (M1/M2/M3/M4) and Intel Macs.
+
+### Option 2: Docker
+
+```bash
+docker pull ghcr.io/hardikshah197/vela:latest
+
+docker run -p 6100:6100 \
+  -v $HOME/Desktop:/workspace \
+  -v $HOME/.claude:/root/.claude \
+  ghcr.io/hardikshah197/vela:latest
+```
+
+Open **http://localhost:6100**.
+
+With Docker Compose:
+```bash
+git clone https://github.com/hardikshah197/Vela.git && cd Vela
+docker-compose up
+```
+
+Multi-arch image available for both `amd64` and `arm64`.
+
+### Option 3: Binary Download
+
+1. Download the tarball for your platform from [GitHub Releases](https://github.com/hardikshah197/Vela/releases/latest):
+   - `vela-1.0.0-darwin-arm64.tar.gz` — macOS Apple Silicon
+   - `vela-1.0.0-darwin-amd64.tar.gz` — macOS Intel
+
+2. Extract and run:
+```bash
+tar xzf vela-1.0.0-darwin-*.tar.gz
+cd vela-1.0.0-darwin-*/
+./bin/vela-server
+```
+
+3. Open **http://localhost:6100**.
+
+### Option 4: From Source
+
+**Prerequisites:**
 - **Go 1.21+** (with CGO enabled — default on macOS)
 - **Node.js 18+** and npm
 - **`gh` CLI** (optional, for GitHub search/fork/clone)
-- **Claude Code** or **OpenAI Codex CLI** installed for the respective agent types
-
-### Setup
 
 ```bash
-# Clone the repo
 git clone https://github.com/hardikshah197/Vela.git
 cd Vela
 
 # Install frontend dependencies
 npm install
 
-# Build the Go backend
-npm run build:server
+# Build everything (Go backend + frontend)
+npm run build:all
 
-# Start both services (two terminals)
+# Run
+./vela-server
+```
+
+Open **http://localhost:6100**.
+
+**For development** (with hot-reload), run two processes:
+```bash
 npm run server    # Go backend on http://localhost:6100
 npm run dev       # Vite dev server on http://localhost:6001
 ```
 
-Open **http://localhost:6001** in your browser.
+Then use **http://localhost:6001** (Vite proxies API calls to the backend).
+
+---
 
 ### First Launch — Onboarding
 
@@ -62,11 +129,21 @@ On your first visit, Vela walks you through a setup wizard:
 
 All settings can be changed later from the Settings panel.
 
-### Production Build
+---
+
+### Environment Variables
+
+Override defaults without touching the UI:
 
 ```bash
-npm run build:all    # Builds both frontend (dist/) and backend (vela-server)
-./vela-server        # Serves everything on port 6100
+# Custom project directories
+VELA_SEARCH_ROOTS=~/projects,~/work vela
+
+# Custom clone directory
+VELA_CLONE_DIR=~/repos vela
+
+# Custom port
+PORT=8080 vela
 ```
 
 ---
