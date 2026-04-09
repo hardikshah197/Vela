@@ -277,7 +277,7 @@ function ServiceEditor({ svc, onChange, onRemove, canRemove, defaultDir }) {
     setResolveStatus("checking");
     const timer = setTimeout(async () => {
       try {
-        const res = await fetch(`${API_BASE}/api/resolve-project?name=${encodeURIComponent(projectQuery.trim())}`);
+        const res = await fetch(`${API_BASE}/api/resolve-project?name=${encodeURIComponent(projectQuery.trim())}`, { headers: authHeaders({}) });
         const data = await res.json();
         if (data.found) {
           setResolveStatus("found");
@@ -289,7 +289,7 @@ function ServiceEditor({ svc, onChange, onRemove, canRemove, defaultDir }) {
           setResolveStatus("searching-github");
           setLocalMatches([]);
           try {
-            const ghRes = await fetch(`${API_BASE}/api/github-search?name=${encodeURIComponent(projectQuery.trim())}`);
+            const ghRes = await fetch(`${API_BASE}/api/github-search?name=${encodeURIComponent(projectQuery.trim())}`, { headers: authHeaders({}) });
             const ghData = await ghRes.json();
             if (ghData.results?.length > 0) {
               setResolveStatus("github-found");
@@ -315,7 +315,7 @@ function ServiceEditor({ svc, onChange, onRemove, canRemove, defaultDir }) {
     try {
       const res = await fetch(`${API_BASE}/api/fork-clone`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({}),
         body: JSON.stringify({ repoFullName }),
       });
       const data = await res.json();
@@ -973,7 +973,7 @@ function SettingsModal({ settings, onClose, onSave }) {
     try {
       await fetch(`${API_BASE}/api/config`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({}),
         body: JSON.stringify({ searchRoots: updated.searchRoots, cloneDir: updated.cloneDir }),
       });
     } catch {}
@@ -984,7 +984,7 @@ function SettingsModal({ settings, onClose, onSave }) {
 
   async function handleReset() {
     try {
-      const res = await fetch(`${API_BASE}/api/config`);
+      const res = await fetch(`${API_BASE}/api/config`, { headers: authHeaders({}) });
       const data = await res.json();
       setDefaultDir(data.searchRoots?.[0] || "");
       setRoots(data.searchRoots || []);
@@ -1350,7 +1350,7 @@ function SessionManagerModal({ workspace, onClose, onImport, onTakeOver, workspa
       if (isScoped && workspace.path) {
         url += `?cwd=${encodeURIComponent(workspace.path)}`;
       }
-      const res = await fetch(url);
+      const res = await fetch(url, { headers: authHeaders({}) });
       const data = await res.json();
       setExternalSessions(data.sessions || []);
     } catch {
@@ -1366,7 +1366,7 @@ function SessionManagerModal({ workspace, onClose, onImport, onTakeOver, workspa
     try {
       await fetch(`${API_BASE}/api/kill-process`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({}),
         body: JSON.stringify({ pid }),
       });
     } catch {}
@@ -1383,7 +1383,7 @@ function SessionManagerModal({ workspace, onClose, onImport, onTakeOver, workspa
       try {
         await fetch(`${API_BASE}/api/kill-process`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: authHeaders({}),
           body: JSON.stringify({ pid }),
         });
       } catch {}
@@ -1396,7 +1396,7 @@ function SessionManagerModal({ workspace, onClose, onImport, onTakeOver, workspa
     try {
       await fetch(`${API_BASE}/api/kill-process`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({}),
         body: JSON.stringify({ pid: session.pid }),
       });
     } catch {}
@@ -1406,7 +1406,7 @@ function SessionManagerModal({ workspace, onClose, onImport, onTakeOver, workspa
       try {
         await fetch(`${API_BASE}/api/kill-session`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: authHeaders({}),
           body: JSON.stringify({ sessionId: workspace.id }),
         });
       } catch {}
@@ -1586,7 +1586,7 @@ function SessionManagerModal({ workspace, onClose, onImport, onTakeOver, workspa
                     try {
                       await fetch(`${API_BASE}/api/kill-process`, {
                         method: "POST",
-                        headers: { "Content-Type": "application/json" },
+                        headers: authHeaders({}),
                         body: JSON.stringify({ pid: s.pid }),
                       });
                     } catch {}
@@ -1873,7 +1873,7 @@ function OnboardingFlow({ onComplete }) {
 
   // Load defaults
   useEffect(() => {
-    fetch(`${API_BASE}/api/config`).then(r => r.json()).then(data => {
+    fetch(`${API_BASE}/api/config`, { headers: authHeaders({}) }).then(r => r.json()).then(data => {
       if (data.searchRoots?.length) setRoots(data.searchRoots);
       if (data.cloneDir) setCloneDir(data.cloneDir);
     }).catch(() => {});
@@ -1893,7 +1893,7 @@ function OnboardingFlow({ onComplete }) {
     try {
       const res = await fetch(`${API_BASE}/api/auth/setup`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({}),
         body: JSON.stringify({ enableAuth, pin: enableAuth ? pin : "", searchRoots: roots, cloneDir }),
       });
       const data = await res.json();
@@ -2191,7 +2191,7 @@ function AuthGate({ authStatus, onSuccess }) {
     try {
       const res = await fetch(`${API_BASE}/api/auth/verify-pin`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({}),
         body: JSON.stringify({ pin }),
       });
       const data = await res.json();
@@ -2228,7 +2228,7 @@ function AuthGate({ authStatus, onSuccess }) {
 
       const res = await fetch(`${API_BASE}/api/auth/webauthn/login`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({}),
         body: JSON.stringify({
           sessionKey: options.sessionKey,
           credentialId: bufferToBase64url(credential.rawId),
@@ -2476,12 +2476,12 @@ export default function App() {
       // Push existing settings to server on load
       fetch(`${API_BASE}/api/config`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({}),
         body: JSON.stringify({ searchRoots: settings.searchRoots, cloneDir: settings.cloneDir }),
       }).catch(() => {});
       return;
     }
-    fetch(`${API_BASE}/api/config`)
+    fetch(`${API_BASE}/api/config`, { headers: authHeaders({}) })
       .then(r => r.json())
       .then(data => {
         const defaults = {
@@ -2511,7 +2511,7 @@ export default function App() {
     // Kill the backend PTY session
     fetch(`${API_BASE}/api/kill-session`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({}),
       body: JSON.stringify({ sessionId: id }),
     }).catch(() => {});
     setWorkspaces(prev => prev.map(w => w.id === id ? { ...w, status: "stopped" } : w));
@@ -2525,7 +2525,7 @@ export default function App() {
     // Kill backend session before removing from list
     fetch(`${API_BASE}/api/kill-session`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({}),
       body: JSON.stringify({ sessionId: id }),
     }).catch(() => {});
     setWorkspaces(prev => prev.filter(w => w.id !== id));
