@@ -116,6 +116,9 @@ func main() {
 		server.Close()
 	}()
 
+	loadAuthConfig()
+	startAuthTokenCleanup()
+
 	log.Printf("[Vela] Running on port %s", port)
 	log.Printf("[Vela] Search roots: %s", strings.Join(searchRoots, ", "))
 	log.Printf("[Vela] Serving static from: %s", distDir)
@@ -130,6 +133,13 @@ func main() {
 // handleRoot dispatches WebSocket upgrades vs static files
 func handleRoot(w http.ResponseWriter, r *http.Request) {
 	if websocket.IsWebSocketUpgrade(r) {
+		if isAuthRequired() {
+			token := r.URL.Query().Get("token")
+			if !validateAuthToken(token) {
+				http.Error(w, "Unauthorized", 401)
+				return
+			}
+		}
 		handleWebSocket(w, r)
 		return
 	}
@@ -175,7 +185,7 @@ func sendJSON(w http.ResponseWriter, data any, status int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)
 }

@@ -29,7 +29,36 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	method := r.Method
 
+	// Auth middleware — enforce token for non-exempt endpoints
+	if !isAuthExempt(path) && isAuthRequired() {
+		if !validateAuthToken(extractToken(r)) {
+			sendJSON(w, map[string]string{"error": "unauthorized"}, 401)
+			return
+		}
+	}
+
 	switch {
+	// --- Auth endpoints ---
+	case path == "/api/auth/status" && method == "GET":
+		handleAuthStatus(w, r)
+	case path == "/api/auth/setup" && method == "POST":
+		handleAuthSetup(w, r)
+	case path == "/api/auth/verify-pin" && method == "POST":
+		handleVerifyPin(w, r)
+	case path == "/api/auth/update" && method == "POST":
+		handleAuthUpdate(w, r)
+	case path == "/api/auth/logout" && method == "POST":
+		handleAuthLogout(w, r)
+	case path == "/api/auth/webauthn/register-options" && method == "GET":
+		handleWebAuthnRegisterOptions(w, r)
+	case path == "/api/auth/webauthn/register" && method == "POST":
+		handleWebAuthnRegister(w, r)
+	case path == "/api/auth/webauthn/login-options" && method == "GET":
+		handleWebAuthnLoginOptions(w, r)
+	case path == "/api/auth/webauthn/login" && method == "POST":
+		handleWebAuthnLogin(w, r)
+
+	// --- Existing endpoints ---
 	case path == "/api/config" && method == "GET":
 		handleGetConfig(w, r)
 	case path == "/api/config" && method == "POST":

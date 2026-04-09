@@ -10,6 +10,7 @@ const args = params.get('args') || '';
 const wsName = params.get('name') || 'workspace';
 const sessionId = params.get('id') || 'unknown';
 const cwd = params.get('cwd') || '';
+const authToken = params.get('token') || localStorage.getItem('vela-auth-token') || '';
 
 const AGENT_META = {
   claude: { color: '#f97316', icon: '\u25C6', brand: 'Claude Code', rgb: '249,115,22' },
@@ -57,9 +58,11 @@ async function uploadFile(file) {
     reader.onload = async () => {
       const base64 = reader.result.split(',')[1];
       try {
+        const uploadHeaders = { 'Content-Type': 'application/json' };
+        if (authToken) uploadHeaders['Authorization'] = `Bearer ${authToken}`;
         const res = await fetch(`${API_BASE}/api/upload`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: uploadHeaders,
           body: JSON.stringify({
             sessionId,
             fileName: file.name || 'file',
@@ -251,7 +254,7 @@ function TerminalPage() {
 
       const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsBase = window.__VELA_WS_BASE__ || (window.location.port === '6001' ? 'ws://localhost:6100' : `${wsProtocol}//${window.location.host}`);
-      const wsUrl = `${wsBase}?agent=${agent}&args=${encodeURIComponent(args)}&id=${sessionId}&cwd=${encodeURIComponent(cwd)}`;
+      const wsUrl = `${wsBase}?agent=${agent}&args=${encodeURIComponent(args)}&id=${sessionId}&cwd=${encodeURIComponent(cwd)}${authToken ? `&token=${encodeURIComponent(authToken)}` : ''}`;
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 

@@ -120,6 +120,8 @@ function openTerminalTab(ws) {
   if (primary.agent === "bash" && primary.command) {
     url += `&command=${encodeURIComponent(primary.command)}`;
   }
+  const token = getAuthToken();
+  if (token) url += `&token=${encodeURIComponent(token)}`;
   window.open(url, "_blank");
 }
 
@@ -803,6 +805,154 @@ function SettingsModal({ settings, onClose, onSave }) {
   const [saving, setSaving] = useState(false);
   const [themeId, setThemeId] = useState(settings?.theme?.id || "ember");
   const [customColor, setCustomColor] = useState(settings?.theme?.accent || "#f97316");
+
+  // Auth settings state
+  const [authEnabled, setAuthEnabled] = useState(false);
+  const [hasPIN, setHasPIN] = useState(false);
+  const [hasFingerprint, setHasFingerprint] = useState(false);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [showChangePin, setShowChangePin] = useState(false);
+  const [newPin, setNewPin] = useState("");
+  const [confirmPin, setConfirmPin] = useState("");
+  const [pinStep, setPinStep] = useState("enter"); // "enter" | "confirm"
+  const [authMsg, setAuthMsg] = useState("");
+  const [authMsgType, setAuthMsgType] = useState(""); // "success" | "error"
+  const [fpLoading, setFpLoading] = useState(false);
+  const webauthnAvailable = typeof window !== "undefined" && !!window.PublicKeyCredential;
+
+  // Load auth status
+  useEffect(() => {
+    fetch(`${API_BASE}/api/auth/status`, { headers: authHeaders({}) })
+      .then(r => r.json())
+      .then(data => {
+        setAuthEnabled(data.enabled);
+        setHasPIN(data.hasPIN);
+        setHasFingerprint(data.hasFingerprint);
+        setAuthLoading(false);
+      })
+      .catch(() => setAuthLoading(false));
+  }, []);
+
+  async function handleToggleAuth(enable) {
+    setAuthMsg("");
+    if (!enable) {
+      // Disable auth
+      try {
+        const res = await fetch(`${API_BASE}/api/auth/update`, {
+          method: "POST", headers: authHeaders({}),
+          body: JSON.stringify({ enabled: false }),
+        });
+        if ((await res.json()).success) {
+          setAuthEnabled(false); setHasPIN(false); setHasFingerprint(false);
+          setShowChangePin(false);
+          setAuthMsg("Authentication disabled"); setAuthMsgType("success");
+        }
+      } catch {
+        setAuthMsg("Could not connect to server"); setAuthMsgType("error");
+      }
+    } else {
+      // Enable — need a PIN first
+      setAuthEnabled(true);
+      setShowChangePin(true);
+      setPinStep("enter");
+      setNewPin("");
+      setConfirmPin("");
+    }
+  }
+
+  async function handleSavePin(pinToSave, confirmToSave) {
+    const pin = pinToSave || newPin;
+    const confirm = confirmToSave || confirmPin;
+    if (pin.length < 4) { setAuthMsg("PIN must be at least 4 digits"); setAuthMsgType("error"); return; }
+    if (pin !== confirm) { setAuthMsg("PINs do not match"); setAuthMsgType("error"); setPinStep("enter"); setNewPin(""); setConfirmPin(""); return; }
+    setAuthMsg("");
+    const body = { newPin: pin, enabled: true };
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/update`, {
+        method: "POST", headers: authHeaders({}),
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setHasPIN(true); setShowChangePin(false); setAuthEnabled(true);
+        setAuthMsg("PIN saved successfully"); setAuthMsgType("success");
+        setNewPin(""); setConfirmPin("");
+      } else {
+        setAuthMsg(data.error || "Failed to save PIN"); setAuthMsgType("error");
+      }
+    } catch {
+      setAuthMsg("Could not connect to server"); setAuthMsgType("error");
+    }
+  }
+
+  async function handleSetupFingerprint() {
+    setFpLoading(true); setAuthMsg("");
+    try {
+      const optRes = await fetch(`${API_BASE}/api/auth/webauthn/register-options`, { headers: authHeaders({}) });
+      const options = await optRes.json();
+      if (options.error) { setAuthMsg(options.error); setAuthMsgType("error"); setFpLoading(false); return; }
+
+      const credential = await navigator.credentials.create({
+        publicKey: {
+          challenge: base64urlToBuffer(options.challenge),
+          rp: options.rp,
+          user: { ...options.user, id: base64urlToBuffer(options.user.id) },
+          pubKeyCredParams: options.pubKeyCredParams,
+          authenticatorSelection: {
+            authenticatorAttachment: "platform",
+            residentKey: "preferred",
+            userVerification: "required",
+          },
+          attestation: "none",
+          timeout: options.timeout,
+        },
+      });
+
+      // getPublicKey() returns SPKI DER — available on AuthenticatorAttestationResponse
+      const attResponse = credential.response;
+      let pubKeyB64 = "";
+      if (attResponse.getPublicKey) {
+        pubKeyB64 = bufferToBase64(attResponse.getPublicKey());
+      } else {
+        setAuthMsg("Browser does not support getPublicKey()"); setAuthMsgType("error"); setFpLoading(false); return;
+      }
+
+      const res = await fetch(`${API_BASE}/api/auth/webauthn/register`, {
+        method: "POST", headers: authHeaders({}),
+        body: JSON.stringify({
+          credentialId: bufferToBase64url(credential.rawId),
+          publicKey: pubKeyB64,
+          clientDataJSON: bufferToBase64(attResponse.clientDataJSON),
+        }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setHasFingerprint(true);
+        setAuthMsg("Passkey registered successfully"); setAuthMsgType("success");
+      } else {
+        setAuthMsg(data.error || "Registration failed"); setAuthMsgType("error");
+      }
+    } catch (e) {
+      if (e.name === "NotAllowedError") {
+        setAuthMsg("Passkey setup was cancelled"); setAuthMsgType("error");
+      } else {
+        console.error("[Vela] Passkey setup error:", e);
+        setAuthMsg(e.message || "Passkey setup failed"); setAuthMsgType("error");
+      }
+    }
+    setFpLoading(false);
+  }
+
+  async function handleRemoveFingerprint() {
+    const res = await fetch(`${API_BASE}/api/auth/update`, {
+      method: "POST", headers: authHeaders({}),
+      body: JSON.stringify({ disableFingerprint: true }),
+    });
+    if ((await res.json()).success) {
+      setHasFingerprint(false);
+      setAuthMsg("Fingerprint removed"); setAuthMsgType("success");
+    }
+  }
   const activeAccent = themeId === "custom" ? customColor : (PRESET_THEMES.find(t => t.id === themeId)?.accent || "#f97316");
 
   function addRoot() {
@@ -869,6 +1019,142 @@ function SettingsModal({ settings, onClose, onSave }) {
         </div>
 
         <div style={{ padding: "20px 28px 24px" }}>
+          {/* Authentication */}
+          <div style={{ marginBottom: 22 }}>
+            <label style={labelStyle}>AUTHENTICATION</label>
+
+            {authLoading ? (
+              <div style={{ color: "#475569", fontSize: 12, fontFamily: "monospace", padding: "12px 0" }}>Loading...</div>
+            ) : (
+              <>
+                {/* Enable/Disable toggle */}
+                <div style={{
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                  padding: "12px 14px", borderRadius: 10,
+                  background: authEnabled ? hexToRgba(activeAccent, 0.06) : "rgba(255,255,255,0.02)",
+                  border: `1px solid ${authEnabled ? hexToRgba(activeAccent, 0.2) : "rgba(255,255,255,0.06)"}`,
+                  cursor: "pointer", transition: "all 0.2s", marginBottom: 10,
+                }} onClick={() => handleToggleAuth(!authEnabled)}>
+                  <div>
+                    <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, fontSize: 12, color: "#e2e8f0" }}>
+                      PIN Authentication
+                    </div>
+                    <div style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b", marginTop: 2 }}>
+                      {authEnabled ? (hasPIN ? "Enabled \u2014 PIN required on launch" : "Set a PIN to activate") : "Disabled \u2014 dashboard is open to anyone"}
+                    </div>
+                  </div>
+                  <div style={{
+                    width: 40, height: 22, borderRadius: 11, padding: 2,
+                    background: authEnabled ? activeAccent : "rgba(255,255,255,0.1)",
+                    transition: "background 0.2s", flexShrink: 0,
+                  }}>
+                    <div style={{
+                      width: 18, height: 18, borderRadius: 9, background: "#fff",
+                      transform: authEnabled ? "translateX(18px)" : "translateX(0)",
+                      transition: "transform 0.2s",
+                    }} />
+                  </div>
+                </div>
+
+                {/* Change PIN */}
+                {authEnabled && (
+                  <>
+                    {!showChangePin ? (
+                      <button
+                        onClick={() => { setShowChangePin(true); setPinStep("enter"); setNewPin(""); setConfirmPin(""); setAuthMsg(""); }}
+                        style={{
+                          display: "block", width: "100%", padding: "10px 14px", borderRadius: 8,
+                          background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)",
+                          color: "#94a3b8", fontFamily: "monospace", fontSize: 12, fontWeight: 600,
+                          cursor: "pointer", textAlign: "left", marginBottom: 10,
+                        }}
+                      >
+                        {hasPIN ? "\uD83D\uDD11 Change PIN" : "\uD83D\uDD11 Set PIN"}
+                      </button>
+                    ) : (
+                      <div style={{
+                        padding: "16px", borderRadius: 10,
+                        background: "rgba(255,255,255,0.02)", border: `1px solid ${hexToRgba(activeAccent, 0.15)}`,
+                        marginBottom: 10,
+                      }}>
+                        <div style={{ textAlign: "center", color: "#94a3b8", fontSize: 12, fontFamily: "'JetBrains Mono', monospace", marginBottom: 14 }}>
+                          {pinStep === "enter" ? "Enter new PIN (4+ digits)" : "Confirm new PIN"}
+                        </div>
+                        <PinInput
+                          length={6}
+                          error={authMsgType === "error"}
+                          onComplete={(p) => {
+                            if (pinStep === "enter") {
+                              setNewPin(p);
+                              setPinStep("confirm");
+                              setAuthMsg("");
+                            } else {
+                              setConfirmPin(p);
+                              // Auto-save when confirm PIN is entered
+                              handleSavePin(newPin, p);
+                            }
+                          }}
+                        />
+                        <div style={{ display: "flex", gap: 8, justifyContent: "center", marginTop: 14 }}>
+                          <button onClick={() => { setShowChangePin(false); setAuthMsg(""); setPinStep("enter"); setNewPin(""); setConfirmPin(""); }} style={{
+                            padding: "6px 16px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.08)",
+                            background: "transparent", color: "#64748b", cursor: "pointer",
+                            fontFamily: "monospace", fontSize: 11, fontWeight: 600,
+                          }}>Cancel</button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Fingerprint */}
+                    {webauthnAvailable && (
+                      <div style={{
+                        display: "flex", alignItems: "center", justifyContent: "space-between",
+                        padding: "10px 14px", borderRadius: 8,
+                        background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)",
+                        marginBottom: 10,
+                      }}>
+                        <div>
+                          <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, fontSize: 12, color: "#e2e8f0" }}>
+                            {"\uD83E\uDD1A"} Passkey / Touch ID
+                          </div>
+                          <div style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b", marginTop: 2 }}>
+                            {hasFingerprint ? "Registered \u2014 available as login method" : "Not configured"}
+                          </div>
+                        </div>
+                        {hasFingerprint ? (
+                          <button onClick={handleRemoveFingerprint} style={{
+                            padding: "6px 12px", borderRadius: 6, border: "1px solid rgba(239,68,68,0.3)",
+                            background: "rgba(239,68,68,0.1)", color: "#ef4444", cursor: "pointer",
+                            fontFamily: "monospace", fontSize: 10, fontWeight: 600, flexShrink: 0,
+                          }}>Remove</button>
+                        ) : (
+                          <button onClick={handleSetupFingerprint} disabled={fpLoading} style={{
+                            padding: "6px 12px", borderRadius: 6, border: `1px solid ${hexToRgba(activeAccent, 0.3)}`,
+                            background: hexToRgba(activeAccent, 0.1), color: activeAccent,
+                            cursor: fpLoading ? "not-allowed" : "pointer",
+                            fontFamily: "monospace", fontSize: 10, fontWeight: 600, flexShrink: 0,
+                            opacity: fpLoading ? 0.5 : 1,
+                          }}>{fpLoading ? "Registering..." : "Set Up"}</button>
+                        )}
+                      </div>
+                    )}
+                  </>
+                )}
+
+                {/* Status message */}
+                {authMsg && (
+                  <div style={{
+                    fontSize: 11, fontFamily: "monospace", marginTop: 4, padding: "6px 10px", borderRadius: 6,
+                    color: authMsgType === "success" ? "#4ade80" : "#ef4444",
+                    background: authMsgType === "success" ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)",
+                  }}>
+                    {authMsg}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
           {/* Default Codebase Directory */}
           <div style={{ marginBottom: 22 }}>
             <label style={labelStyle}>DEFAULT CODEBASE DIRECTORY</label>
@@ -1460,6 +1746,577 @@ function SessionManagerModal({ workspace, onClose, onImport, onTakeOver, workspa
 // Track whether the initial load succeeded to prevent data destruction
 let _loadedFromStorage = false;
 
+// --- Base64url helpers for WebAuthn ---
+function base64urlToBuffer(b64url) {
+  const b64 = b64url.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = b64.length % 4 === 0 ? "" : "=".repeat(4 - (b64.length % 4));
+  const binary = atob(b64 + pad);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+function bufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function bufferToBase64url(buffer) {
+  return bufferToBase64(buffer).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+
+function getAuthToken() {
+  return localStorage.getItem("vela-auth-token") || "";
+}
+
+function authHeaders(extra = {}) {
+  const token = getAuthToken();
+  const h = { "Content-Type": "application/json", ...extra };
+  if (token) h["Authorization"] = `Bearer ${token}`;
+  return h;
+}
+
+// --- PinInput component ---
+function PinInput({ length = 4, onComplete, error, disabled }) {
+  const [digits, setDigits] = useState(Array(length).fill(""));
+  const inputRefs = useRef([]);
+
+  useEffect(() => {
+    if (inputRefs.current[0]) inputRefs.current[0].focus();
+  }, []);
+
+  // Reset digits when error changes (wrong PIN)
+  useEffect(() => {
+    if (error) {
+      setDigits(Array(length).fill(""));
+      setTimeout(() => { if (inputRefs.current[0]) inputRefs.current[0].focus(); }, 300);
+    }
+  }, [error, length]);
+
+  function handleChange(index, value) {
+    if (!/^\d?$/.test(value)) return;
+    const next = [...digits];
+    next[index] = value;
+    setDigits(next);
+
+    if (value && index < length - 1) {
+      inputRefs.current[index + 1].focus();
+    }
+    if (next.every(d => d !== "")) {
+      onComplete(next.join(""));
+    }
+  }
+
+  function handleKeyDown(index, e) {
+    if (e.key === "Backspace" && !digits[index] && index > 0) {
+      inputRefs.current[index - 1].focus();
+    }
+  }
+
+  function handlePaste(e) {
+    e.preventDefault();
+    const text = (e.clipboardData.getData("text") || "").replace(/\D/g, "").slice(0, length);
+    if (!text) return;
+    const next = Array(length).fill("");
+    for (let i = 0; i < text.length; i++) next[i] = text[i];
+    setDigits(next);
+    if (text.length >= length) onComplete(next.join(""));
+    else if (inputRefs.current[text.length]) inputRefs.current[text.length].focus();
+  }
+
+  const boxStyle = (i) => ({
+    width: 48, height: 56, textAlign: "center",
+    fontSize: 24, fontWeight: 700,
+    background: "#0d1117",
+    border: `2px solid ${error ? "#ef4444" : digits[i] ? "rgba(255,255,255,0.2)" : "rgba(255,255,255,0.08)"}`,
+    borderRadius: 12, color: "#f1f5f9",
+    fontFamily: "'JetBrains Mono', monospace",
+    outline: "none", caretColor: "transparent",
+    transition: "border-color 0.15s",
+  });
+
+  return (
+    <div style={{ display: "flex", gap: 12, justifyContent: "center" }}>
+      {digits.map((d, i) => (
+        <input
+          key={i}
+          ref={el => inputRefs.current[i] = el}
+          type="password"
+          inputMode="numeric"
+          maxLength={1}
+          value={d}
+          disabled={disabled}
+          onChange={e => handleChange(i, e.target.value)}
+          onKeyDown={e => handleKeyDown(i, e)}
+          onPaste={handlePaste}
+          style={boxStyle(i)}
+        />
+      ))}
+    </div>
+  );
+}
+
+// --- Onboarding Flow ---
+function OnboardingFlow({ onComplete }) {
+  const [step, setStep] = useState(0);
+  const [roots, setRoots] = useState([]);
+  const [cloneDir, setCloneDir] = useState("");
+  const [newRoot, setNewRoot] = useState("");
+  const [enableAuth, setEnableAuth] = useState(false);
+  const [pin, setPin] = useState("");
+  const [pinConfirm, setPinConfirm] = useState("");
+  const [pinStep, setPinStep] = useState("enter"); // "enter" | "confirm"
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  // Load defaults
+  useEffect(() => {
+    fetch(`${API_BASE}/api/config`).then(r => r.json()).then(data => {
+      if (data.searchRoots?.length) setRoots(data.searchRoots);
+      if (data.cloneDir) setCloneDir(data.cloneDir);
+    }).catch(() => {});
+  }, []);
+
+  function addRoot() {
+    const v = newRoot.trim();
+    if (v && !roots.includes(v)) { setRoots(prev => [...prev, v]); setNewRoot(""); }
+  }
+
+  async function handleFinish() {
+    if (enableAuth) {
+      if (pin.length < 4) { setError("PIN must be at least 4 digits"); return; }
+      if (pin !== pinConfirm) { setError("PINs do not match"); setPinStep("enter"); setPin(""); setPinConfirm(""); return; }
+    }
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/setup`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enableAuth, pin: enableAuth ? pin : "", searchRoots: roots, cloneDir }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        // Save settings to localStorage for the existing settings flow
+        const s = { searchRoots: roots, cloneDir, defaultCodebaseDir: roots[0] || "" };
+        try { localStorage.setItem("vela-settings", JSON.stringify(s)); } catch {}
+        onComplete(data.token);
+      } else {
+        setError(data.error || "Setup failed");
+      }
+    } catch {
+      setError("Could not connect to server");
+    }
+    setLoading(false);
+  }
+
+  const cardStyle = {
+    background: "#0f1117", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 20,
+    width: "min(520px, 92vw)", padding: "36px 32px", boxShadow: "0 40px 80px rgba(0,0,0,0.8)",
+    animation: "slideUp 0.3s ease",
+  };
+  const btnPrimary = {
+    padding: "12px 32px", borderRadius: 10, border: "none", fontFamily: "'JetBrains Mono', monospace",
+    fontWeight: 700, fontSize: 14, cursor: "pointer", letterSpacing: 0.5,
+    background: "linear-gradient(135deg, #f97316, #fb923c)", color: "#fff",
+    transition: "all 0.2s",
+  };
+  const btnSecondary = {
+    padding: "12px 24px", borderRadius: 10, border: "1px solid rgba(255,255,255,0.1)",
+    background: "rgba(255,255,255,0.04)", color: "#94a3b8",
+    fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, fontSize: 13, cursor: "pointer",
+  };
+  const inputStyle = {
+    width: "100%", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)",
+    borderRadius: 8, padding: "10px 14px", color: "#f1f5f9", fontFamily: "monospace",
+    fontSize: 13, outline: "none", boxSizing: "border-box",
+  };
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, background: "#080b10",
+      display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200,
+    }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        @keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }
+        @keyframes slideUp { from { transform: translateY(20px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
+        input:focus { border-color: rgba(255,255,255,0.25) !important; }
+      `}</style>
+
+      {/* Background grid */}
+      <div style={{
+        position: "fixed", inset: 0, pointerEvents: "none",
+        backgroundImage: "linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px)",
+        backgroundSize: "40px 40px",
+      }} />
+
+      {step === 0 && (
+        <div style={{ ...cardStyle, width: "min(640px, 92vw)", padding: "48px 40px", textAlign: "center" }}>
+          {/* Glowing logo */}
+          <div style={{
+            width: 72, height: 72, margin: "0 auto 24px", borderRadius: 18,
+            background: "linear-gradient(135deg, rgba(249,115,22,0.15), rgba(251,146,60,0.08))",
+            border: "1px solid rgba(249,115,22,0.3)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            boxShadow: "0 0 40px rgba(249,115,22,0.15), inset 0 0 20px rgba(249,115,22,0.05)",
+          }}>
+            <span style={{ fontSize: 36, color: "#f97316", filter: "drop-shadow(0 0 8px rgba(249,115,22,0.5))" }}>{"\u25C6"}</span>
+          </div>
+
+          <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 32, color: "#f1f5f9", letterSpacing: 1.5 }}>
+            Welcome to Vela
+          </div>
+          <div style={{ color: "#94a3b8", fontSize: 15, marginTop: 10, lineHeight: 1.7 }}>
+            Your command center for AI coding agents.
+          </div>
+
+          {/* Feature highlights */}
+          <div style={{
+            display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12,
+            margin: "32px 0", textAlign: "left",
+          }}>
+            {[
+              { icon: "\u25B6", title: "Launch Agents", desc: "Spawn Claude Code, Codex, or custom shells in managed terminals" },
+              { icon: "\u21C4", title: "Multi-Service", desc: "Run multiple agents side by side in a single workspace" },
+              { icon: "\u21BB", title: "Session Persistence", desc: "Sessions survive disconnects with full scrollback replay" },
+              { icon: "\uD83D\uDD12", title: "Optional Security", desc: "PIN and fingerprint authentication to protect your dashboard" },
+            ].map((f, i) => (
+              <div key={i} style={{
+                padding: "14px 16px", borderRadius: 12,
+                background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)",
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                  <span style={{ fontSize: 14, opacity: 0.7 }}>{f.icon}</span>
+                  <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 12, color: "#e2e8f0", letterSpacing: 0.5 }}>
+                    {f.title}
+                  </span>
+                </div>
+                <div style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b", lineHeight: 1.5 }}>
+                  {f.desc}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Version / credits */}
+          <div style={{ color: "#334155", fontSize: 11, fontFamily: "monospace", marginBottom: 28 }}>
+            v1.0 {"\u00B7"} Built for developers who ship with AI
+          </div>
+
+          <button onClick={() => setStep(1)} style={{ ...btnPrimary, padding: "14px 40px", fontSize: 15 }}>
+            Get Started {"\u2192"}
+          </button>
+        </div>
+      )}
+
+      {step === 1 && (
+        <div style={{ ...cardStyle, width: "min(600px, 92vw)", padding: "40px 36px" }}>
+          {/* Step indicator */}
+          <div style={{ display: "flex", gap: 8, marginBottom: 24 }}>
+            {[1, 2].map(n => (
+              <div key={n} style={{
+                height: 3, flex: 1, borderRadius: 2,
+                background: n <= 1 ? "#f97316" : "rgba(255,255,255,0.08)",
+                transition: "background 0.3s",
+              }} />
+            ))}
+          </div>
+          <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 22, color: "#f1f5f9", marginBottom: 6 }}>
+            Project Directories
+          </div>
+          <div style={{ color: "#64748b", fontSize: 13, marginBottom: 8, fontFamily: "monospace", lineHeight: 1.6 }}>
+            Tell Vela where your projects live. It will scan these directories (up to 5 levels deep) to find repos when you create a workspace.
+          </div>
+          <div style={{ color: "#475569", fontSize: 11, marginBottom: 24, fontFamily: "monospace", padding: "8px 12px", borderRadius: 8, background: "rgba(249,115,22,0.05)", border: "1px solid rgba(249,115,22,0.1)" }}>
+            Tip: Add your main workspace folder (e.g. ~/Desktop/workplace) to cover all projects at once.
+          </div>
+
+          <div style={{ marginBottom: 20 }}>
+            <label style={{ fontSize: 10, fontWeight: 700, color: "#475569", letterSpacing: 1.5, fontFamily: "monospace", display: "block", marginBottom: 6 }}>
+              SEARCH ROOTS
+            </label>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 8 }}>
+              {roots.map(r => (
+                <div key={r} style={{
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                  background: "rgba(255,255,255,0.025)", border: "1px solid rgba(255,255,255,0.06)",
+                  borderRadius: 6, padding: "6px 10px",
+                }}>
+                  <span style={{ fontFamily: "monospace", fontSize: 12, color: "#94a3b8" }}>{r}</span>
+                  <button onClick={() => setRoots(prev => prev.filter(x => x !== r))}
+                    style={{ background: "none", border: "none", color: "#ef4444", cursor: "pointer", fontFamily: "monospace", fontSize: 14 }}>
+                    {"\u2715"}
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <input value={newRoot} onChange={e => setNewRoot(e.target.value)}
+                placeholder="/path/to/projects" onKeyDown={e => e.key === "Enter" && addRoot()}
+                style={{ ...inputStyle, flex: 1, fontSize: 12 }} />
+              <button onClick={addRoot} style={{
+                background: "rgba(34,197,94,0.1)", border: "1px solid rgba(34,197,94,0.25)",
+                color: "#4ade80", padding: "8px 14px", borderRadius: 6,
+                fontFamily: "monospace", fontSize: 12, fontWeight: 600, cursor: "pointer",
+              }}>+ Add</button>
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 28 }}>
+            <label style={{ fontSize: 10, fontWeight: 700, color: "#475569", letterSpacing: 1.5, fontFamily: "monospace", display: "block", marginBottom: 6 }}>
+              CLONE DIRECTORY
+            </label>
+            <input value={cloneDir} onChange={e => setCloneDir(e.target.value)}
+              placeholder="/path/to/cloned/repos" style={inputStyle} />
+            <div style={{ fontSize: 10, color: "#475569", fontFamily: "monospace", marginTop: 4 }}>
+              Where GitHub repos are forked/cloned to
+            </div>
+          </div>
+
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+            <button onClick={() => setStep(0)} style={btnSecondary}>Back</button>
+            <button onClick={() => setStep(2)} style={btnPrimary}>Continue</button>
+          </div>
+        </div>
+      )}
+
+      {step === 2 && (
+        <div style={{ ...cardStyle, width: "min(600px, 92vw)", padding: "40px 36px" }}>
+          {/* Step indicator */}
+          <div style={{ display: "flex", gap: 8, marginBottom: 24 }}>
+            {[1, 2].map(n => (
+              <div key={n} style={{
+                height: 3, flex: 1, borderRadius: 2,
+                background: n <= 2 ? "#f97316" : "rgba(255,255,255,0.08)",
+                transition: "background 0.3s",
+              }} />
+            ))}
+          </div>
+          <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 22, color: "#f1f5f9", marginBottom: 6 }}>
+            Security
+          </div>
+          <div style={{ color: "#64748b", fontSize: 13, marginBottom: 8, fontFamily: "monospace", lineHeight: 1.6 }}>
+            Add a PIN to protect your dashboard from unauthorized access. You can also set up fingerprint authentication later in Settings.
+          </div>
+          <div style={{ color: "#475569", fontSize: 11, marginBottom: 24, fontFamily: "monospace", padding: "8px 12px", borderRadius: 8, background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)" }}>
+            You can always change these settings later from the Settings panel.
+          </div>
+
+          {/* Toggle */}
+          <div style={{
+            display: "flex", alignItems: "center", justifyContent: "space-between",
+            padding: "14px 16px", borderRadius: 10,
+            background: enableAuth ? "rgba(249,115,22,0.08)" : "rgba(255,255,255,0.025)",
+            border: `1px solid ${enableAuth ? "rgba(249,115,22,0.25)" : "rgba(255,255,255,0.06)"}`,
+            marginBottom: 24, cursor: "pointer", transition: "all 0.2s",
+          }} onClick={() => { setEnableAuth(!enableAuth); setError(""); }}>
+            <div>
+              <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, fontSize: 13, color: "#f1f5f9" }}>
+                Enable PIN Authentication
+              </div>
+              <div style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b", marginTop: 2 }}>
+                Required each time you open the dashboard
+              </div>
+            </div>
+            <div style={{
+              width: 44, height: 24, borderRadius: 12, padding: 2,
+              background: enableAuth ? "#f97316" : "rgba(255,255,255,0.1)",
+              transition: "background 0.2s", flexShrink: 0,
+            }}>
+              <div style={{
+                width: 20, height: 20, borderRadius: 10, background: "#fff",
+                transform: enableAuth ? "translateX(20px)" : "translateX(0)",
+                transition: "transform 0.2s",
+              }} />
+            </div>
+          </div>
+
+          {enableAuth && (
+            <div style={{ marginBottom: 24 }}>
+              {pinStep === "enter" ? (
+                <>
+                  <div style={{ textAlign: "center", color: "#94a3b8", fontSize: 13, fontFamily: "'JetBrains Mono', monospace", marginBottom: 16 }}>
+                    Enter a PIN (4+ digits)
+                  </div>
+                  <PinInput length={6} error={!!error} onComplete={(p) => { setPin(p); setPinStep("confirm"); setError(""); }} />
+                </>
+              ) : (
+                <>
+                  <div style={{ textAlign: "center", color: "#94a3b8", fontSize: 13, fontFamily: "'JetBrains Mono', monospace", marginBottom: 16 }}>
+                    Confirm your PIN
+                  </div>
+                  <PinInput length={6} error={!!error} onComplete={(p) => { setPinConfirm(p); }} />
+                </>
+              )}
+              {error && (
+                <div style={{ textAlign: "center", color: "#ef4444", fontSize: 12, fontFamily: "monospace", marginTop: 12 }}>
+                  {error}
+                </div>
+              )}
+            </div>
+          )}
+
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+            <button onClick={() => { setStep(1); setError(""); }} style={btnSecondary}>Back</button>
+            <button
+              onClick={handleFinish}
+              disabled={loading || (enableAuth && pinStep === "enter") || (enableAuth && pinStep === "confirm" && !pinConfirm)}
+              style={{
+                ...btnPrimary,
+                opacity: (loading || (enableAuth && pinStep === "enter") || (enableAuth && pinStep === "confirm" && !pinConfirm)) ? 0.5 : 1,
+                cursor: loading ? "not-allowed" : "pointer",
+              }}
+            >
+              {loading ? "Setting up..." : "Complete Setup"}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// --- Auth Gate ---
+function AuthGate({ authStatus, onSuccess }) {
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [fingerprintAttempted, setFingerprintAttempted] = useState(false);
+
+  async function handlePinSubmit(pin) {
+    setLoading(true);
+    setError("");
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/verify-pin`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pin }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        onSuccess(data.token);
+      } else {
+        setError("Invalid PIN");
+      }
+    } catch {
+      setError("Could not connect to server");
+    }
+    setLoading(false);
+  }
+
+  async function handleFingerprint() {
+    setError("");
+    try {
+      const optRes = await fetch(`${API_BASE}/api/auth/webauthn/login-options`);
+      const options = await optRes.json();
+      if (options.error) { setError(options.error); return; }
+
+      const credential = await navigator.credentials.get({
+        publicKey: {
+          challenge: base64urlToBuffer(options.challenge),
+          rpId: options.rpId,
+          allowCredentials: options.allowCredentials.map(c => ({
+            type: c.type,
+            id: base64urlToBuffer(c.id),
+          })),
+          userVerification: options.userVerification,
+          timeout: options.timeout,
+        },
+      });
+
+      const res = await fetch(`${API_BASE}/api/auth/webauthn/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionKey: options.sessionKey,
+          credentialId: bufferToBase64url(credential.rawId),
+          authenticatorData: bufferToBase64(credential.response.authenticatorData),
+          clientDataJSON: bufferToBase64(credential.response.clientDataJSON),
+          signature: bufferToBase64(credential.response.signature),
+        }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        onSuccess(data.token);
+      } else {
+        setError(data.error || "Fingerprint verification failed");
+      }
+    } catch (e) {
+      if (e.name !== "NotAllowedError") {
+        setError("Fingerprint verification failed");
+      }
+    }
+  }
+
+  // Auto-trigger fingerprint on mount
+  useEffect(() => {
+    if (authStatus.hasFingerprint && !fingerprintAttempted) {
+      setFingerprintAttempted(true);
+      handleFingerprint();
+    }
+  }, []);
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, background: "#080b10",
+      display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200,
+    }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        @keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }
+        @keyframes slideUp { from { transform: translateY(20px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
+        input:focus { border-color: rgba(255,255,255,0.25) !important; }
+      `}</style>
+
+      <div style={{
+        position: "fixed", inset: 0, pointerEvents: "none",
+        backgroundImage: "linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px)",
+        backgroundSize: "40px 40px",
+      }} />
+
+      <div style={{
+        background: "#0f1117", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 20,
+        width: "min(420px, 92vw)", padding: "40px 32px", textAlign: "center",
+        boxShadow: "0 40px 80px rgba(0,0,0,0.8)", animation: "slideUp 0.3s ease",
+      }}>
+        <div style={{ fontSize: 36, marginBottom: 8 }}>{"\u25C6"}</div>
+        <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 22, color: "#f1f5f9", letterSpacing: 0.5, marginBottom: 4 }}>
+          Vela
+        </div>
+        <div style={{ color: "#64748b", fontSize: 12, fontFamily: "monospace", marginBottom: 32 }}>
+          Enter your PIN to unlock
+        </div>
+
+        <PinInput length={6} error={!!error} disabled={loading} onComplete={handlePinSubmit} />
+
+        {error && (
+          <div style={{
+            color: "#ef4444", fontSize: 12, fontFamily: "monospace", marginTop: 14,
+            animation: "fadeIn 0.2s",
+          }}>
+            {error}
+          </div>
+        )}
+
+        {authStatus.hasFingerprint && (
+          <button onClick={handleFingerprint} style={{
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+            margin: "24px auto 0", padding: "10px 24px", borderRadius: 10,
+            background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)",
+            color: "#94a3b8", fontFamily: "'JetBrains Mono', monospace", fontSize: 13,
+            fontWeight: 600, cursor: "pointer", transition: "all 0.15s",
+          }}>
+            <span style={{ fontSize: 18 }}>{"\uD83E\uDD1A"}</span> Use Fingerprint
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function loadWorkspaces() {
   try {
     const saved = localStorage.getItem("vela-workspaces");
@@ -1521,9 +2378,37 @@ function saveSettings(s) {
 }
 
 export default function App() {
+  const [authStatus, setAuthStatus] = useState(null); // null = loading
+  const [authToken, setAuthToken] = useState(() => getAuthToken());
   const [workspaces, setWorkspaces] = useState(loadWorkspaces);
   const [settings, setSettings] = useState(loadSettings);
   const [showSettings, setShowSettings] = useState(false);
+
+  // Check auth status on mount and when token changes
+  useEffect(() => {
+    const headers = {};
+    if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
+    fetch(`${API_BASE}/api/auth/status`, { headers })
+      .then(r => r.json())
+      .then(setAuthStatus)
+      .catch(() => {
+        // Backend unreachable — skip auth to avoid lockout
+        setAuthStatus({ onboardingDone: true, enabled: false, authenticated: true });
+      });
+  }, [authToken]);
+
+  function handleAuthSuccess(token) {
+    if (token) {
+      localStorage.setItem("vela-auth-token", token);
+      setAuthToken(token);
+    }
+    // Refresh auth status
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+    fetch(`${API_BASE}/api/auth/status`, { headers })
+      .then(r => r.json())
+      .then(setAuthStatus)
+      .catch(() => {});
+  }
 
   // Persist whenever workspaces change
   useEffect(() => {
@@ -1536,7 +2421,7 @@ export default function App() {
 
     async function reconcileSessions() {
       try {
-        const res = await fetch(`${API_BASE}/api/sessions`);
+        const res = await fetch(`${API_BASE}/api/sessions`, { headers: authHeaders({}) });
         if (!res.ok) return;
         const { sessions: alive } = await res.json();
         const aliveIds = new Set(alive.filter(s => s.alive).map(s => s.id));
@@ -1678,6 +2563,24 @@ export default function App() {
     stopped: workspaces.filter(w => w.status === "stopped").length,
   };
 
+  // --- Auth gates (rendered before dashboard) ---
+  if (authStatus === null) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", background: "#080b10" }}>
+        <div style={{ width: 36, height: 36, borderRadius: "50%", border: "3px solid rgba(255,255,255,0.1)", borderTopColor: "#f97316", animation: "spin 1s linear infinite" }} />
+        <style>{`@keyframes spin { to { transform: rotate(360deg) } }`}</style>
+      </div>
+    );
+  }
+
+  if (!authStatus.onboardingDone) {
+    return <OnboardingFlow onComplete={handleAuthSuccess} />;
+  }
+
+  if (authStatus.enabled && !authStatus.authenticated) {
+    return <AuthGate authStatus={authStatus} onSuccess={handleAuthSuccess} />;
+  }
+
   return (
     <div style={{ minHeight: "100vh", background: "#080b10", color: "#f1f5f9", fontFamily: "system-ui, sans-serif" }}>
       <style>{`
@@ -1720,6 +2623,28 @@ export default function App() {
             </div>
 
             <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              {authStatus?.enabled && (
+                <button
+                  onClick={() => {
+                    localStorage.removeItem("vela-auth-token");
+                    setAuthToken("");
+                    fetch(`${API_BASE}/api/auth/logout`, { method: "POST", headers: authHeaders({}) }).catch(() => {});
+                    setAuthStatus(prev => ({ ...prev, authenticated: false }));
+                  }}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 6,
+                    background: "rgba(239,68,68,0.06)",
+                    border: "1px solid rgba(239,68,68,0.15)",
+                    borderRadius: 8, padding: "9px 14px",
+                    color: "#ef4444", fontFamily: "monospace", fontWeight: 600,
+                    fontSize: 12, cursor: "pointer",
+                    transition: "all 0.2s",
+                  }}
+                  title="Lock Dashboard"
+                >
+                  {"\uD83D\uDD12"} Lock
+                </button>
+              )}
               <button
                 onClick={() => setShowSettings(true)}
                 style={{
