@@ -303,9 +303,16 @@ func broadcastScreenshot(path string) {
 }
 
 func resolveDistDir() string {
-	// Try relative to binary location
 	if exe, err := os.Executable(); err == nil {
-		candidate := filepath.Join(filepath.Dir(exe), "..", "dist")
+		binDir := filepath.Dir(exe)
+		// Homebrew: <prefix>/share/vela/dist (binary is in <prefix>/bin/)
+		candidate := filepath.Join(binDir, "..", "share", "vela", "dist")
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			abs, _ := filepath.Abs(candidate)
+			return abs
+		}
+		// Tarball / local: ../dist relative to binary
+		candidate = filepath.Join(binDir, "..", "dist")
 		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
 			abs, _ := filepath.Abs(candidate)
 			return abs
