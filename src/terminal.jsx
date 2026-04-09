@@ -15,9 +15,11 @@ const AGENT_META = {
   claude: { color: '#f97316', icon: '\u25C6', brand: 'Claude Code', rgb: '249,115,22' },
   codex: { color: '#8b5cf6', icon: '\u2B21', brand: 'OpenAI Codex', rgb: '139,92,246' },
   ralph: { color: '#06b6d4', icon: '\u21BB', brand: 'Ralph Loop', rgb: '6,182,212' },
+  bash: { color: '#22c55e', icon: '\u276F', brand: 'Shell', rgb: '34,197,94' },
 };
 
 const meta = AGENT_META[agent] || AGENT_META.claude;
+const API_BASE = window.__VELA_API_BASE__ || (window.location.port === '6001' ? 'http://localhost:6100' : '');
 
 document.title = `${wsName} \u2014 Vela Terminal`;
 
@@ -55,8 +57,7 @@ async function uploadFile(file) {
     reader.onload = async () => {
       const base64 = reader.result.split(',')[1];
       try {
-        const apiBase = window.__VELA_API_BASE__ || (window.location.port === '5173' ? 'http://localhost:3001' : '');
-        const res = await fetch(`${apiBase}/api/upload`, {
+        const res = await fetch(`${API_BASE}/api/upload`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -89,12 +90,15 @@ function getFileFromItems(items) {
 }
 
 // --- Status styles ---
+const MAX_RECONNECT_ATTEMPTS = 12; // ~40s total with exponential backoff
+
 const STATUS_STYLES = {
   CONNECTING: { color: '#f59e0b', shadow: 'none' },
   CONNECTED: { color: '#22c55e', shadow: '0 0 8px rgba(34,197,94,0.6)' },
   DISCONNECTED: { color: '#ef4444', shadow: 'none' },
   RECONNECTING: { color: '#f59e0b', shadow: '0 0 8px rgba(245,158,11,0.4)' },
   SESSION_ENDED: { color: '#64748b', shadow: 'none' },
+  GAVE_UP: { color: '#ef4444', shadow: 'none' },
 };
 
 function TerminalPage() {
@@ -105,8 +109,11 @@ function TerminalPage() {
   const [sessionEnded, setSessionEnded] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [uploadStatus, setUploadStatus] = useState(null); // null | 'uploading' | { path } | { error }
+  const [screenshotToast, setScreenshotToast] = useState(null); // null | { path }
   const disposedRef = useRef(false);
   const reconnectTimerRef = useRef(null);
+  const connectRef = useRef(null); // expose connect() for manual retry
+  const reconnectAttemptRef = useRef(0);
   const dragCounterRef = useRef(0);
 
   // Client scrollback buffer — accumulates all terminal data for localStorage
@@ -181,6 +188,18 @@ function TerminalPage() {
     fitAddon.fit();
     xtermRef.current = term;
 
+    // Shift+Enter → send newline for multi-line input in Claude Code
+    term.attachCustomKeyEventHandler((event) => {
+      if (event.type === 'keydown' && event.key === 'Enter' && event.shiftKey) {
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'input', data: '\n' }));
+        }
+        return false;
+      }
+      return true;
+    });
+
     // --- Restore saved scrollback from localStorage on mount ---
     const savedScrollback = loadLocalScrollback();
     if (savedScrollback) {
@@ -214,8 +233,9 @@ function TerminalPage() {
       scheduleSave();
     }
 
-    let reconnectAttempt = 0;
+    reconnectAttemptRef.current = 0;
     let hasConnectedBefore = false;
+    let sessionEstablished = false; // true after first new_session is processed
 
     // Single input handler — always uses current WebSocket ref
     term.onData((data) => {
@@ -230,14 +250,14 @@ function TerminalPage() {
       setConnStatus(hasConnectedBefore ? 'RECONNECTING' : 'CONNECTING');
 
       const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsBase = window.__VELA_WS_BASE__ || (window.location.port === '5173' ? 'ws://localhost:3001' : `${wsProtocol}//${window.location.host}`);
+      const wsBase = window.__VELA_WS_BASE__ || (window.location.port === '6001' ? 'ws://localhost:6100' : `${wsProtocol}//${window.location.host}`);
       const wsUrl = `${wsBase}?agent=${agent}&args=${encodeURIComponent(args)}&id=${sessionId}&cwd=${encodeURIComponent(cwd)}`;
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
         setConnStatus('CONNECTED');
-        reconnectAttempt = 0;
+        reconnectAttemptRef.current = 0;
         hasConnectedBefore = true;
         // Send current terminal size
         ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
@@ -267,8 +287,31 @@ function TerminalPage() {
                 saveLocalScrollback(scrollbackRef.current);
                 return;
               }
+              if (ctrl.__vela === 'screenshot') {
+                if (document.hasFocus()) {
+                  const ws = wsRef.current;
+                  if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'input', data: ctrl.path + ' ' }));
+                  }
+                }
+                setScreenshotToast({ path: ctrl.path });
+                setTimeout(() => setScreenshotToast(null), 5000);
+                return;
+              }
               if (ctrl.__vela === 'new_session') {
-                if (scrollbackRef.current.length > 0) {
+                if (sessionEstablished) {
+                  // Backend lost the session (restart/timeout) — clear and explain
+                  term.reset();
+                  resetScrollback();
+                  const msg = '\r\n\x1b[33m' +
+                    '─'.repeat(60) + '\r\n' +
+                    '  Previous session expired\r\n' +
+                    '  Starting new agent session...\r\n' +
+                    '─'.repeat(60) +
+                    '\x1b[0m\r\n\r\n';
+                  term.write(msg);
+                  appendScrollback(msg);
+                } else if (scrollbackRef.current.length > 0) {
                   const divider = '\r\n\x1b[90m' +
                     '─'.repeat(60) + '\r\n' +
                     '  Previous session restored from local cache\r\n' +
@@ -278,6 +321,7 @@ function TerminalPage() {
                   term.write(divider);
                   appendScrollback(divider);
                 }
+                sessionEstablished = true;
                 return;
               }
             } catch {
@@ -307,10 +351,16 @@ function TerminalPage() {
         }
         // Immediately save on disconnect so content persists
         saveLocalScrollback(scrollbackRef.current);
+
+        if (reconnectAttemptRef.current >= MAX_RECONNECT_ATTEMPTS) {
+          setConnStatus('GAVE_UP');
+          return;
+        }
+
         setConnStatus('DISCONNECTED');
         // Auto-reconnect with exponential backoff (1s, 2s, 4s, ... max 10s)
-        const delay = Math.min(1000 * Math.pow(2, reconnectAttempt), 10000);
-        reconnectAttempt++;
+        const delay = Math.min(1000 * Math.pow(2, reconnectAttemptRef.current), 10000);
+        reconnectAttemptRef.current++;
         reconnectTimerRef.current = setTimeout(connect, delay);
       };
 
@@ -319,6 +369,7 @@ function TerminalPage() {
       };
     }
 
+    connectRef.current = connect;
     connect();
 
     // Handle window resize
@@ -362,7 +413,14 @@ function TerminalPage() {
   }, []);
 
   const statusCfg = STATUS_STYLES[connStatus];
-  const showOverlay = connStatus === 'DISCONNECTED' || connStatus === 'RECONNECTING';
+  const showOverlay = connStatus === 'DISCONNECTED' || connStatus === 'RECONNECTING' || connStatus === 'GAVE_UP';
+
+  const handleManualRetry = () => {
+    reconnectAttemptRef.current = 0;
+    disposedRef.current = false;
+    setConnStatus('RECONNECTING');
+    if (connectRef.current) connectRef.current();
+  };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: '#080b10' }}>
@@ -532,6 +590,34 @@ function TerminalPage() {
           </div>
         )}
 
+        {/* Screenshot auto-attach toast */}
+        {screenshotToast && (
+          <div style={{
+            position: 'absolute', bottom: uploadStatus ? 70 : 16, left: 16, zIndex: 9998,
+            padding: '10px 14px', borderRadius: 10,
+            background: 'rgba(6,182,212,0.15)',
+            border: '1px solid rgba(6,182,212,0.4)',
+            display: 'flex', alignItems: 'center', gap: 12,
+            fontFamily: "'JetBrains Mono', monospace",
+            maxWidth: 420,
+          }}>
+            <img
+              src={`${API_BASE}/api/file-preview?path=${encodeURIComponent(screenshotToast.path)}`}
+              style={{ width: 64, height: 40, objectFit: 'cover', borderRadius: 6, border: '1px solid rgba(6,182,212,0.3)' }}
+              alt="Screenshot"
+              onError={(e) => { e.target.style.display = 'none'; }}
+            />
+            <div>
+              <div style={{ color: '#06b6d4', fontSize: 12, fontWeight: 600, letterSpacing: 0.5 }}>
+                Screenshot attached
+              </div>
+              <div style={{ color: '#64748b', fontSize: 11, marginTop: 2, wordBreak: 'break-all' }}>
+                {screenshotToast.path.split('/').pop()}
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Reconnecting overlay — high z-index to render above xterm canvas */}
         {showOverlay && (
           <div style={{
@@ -540,35 +626,94 @@ function TerminalPage() {
             display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
             zIndex: 9999,
           }}>
-            <div style={{
-              width: 44, height: 44, borderRadius: '50%',
-              border: '3px solid rgba(255,255,255,0.1)',
-              borderTopColor: meta.color,
-              animation: 'vela-spin 1s linear infinite',
-              marginBottom: 24,
-            }} />
-            <div style={{
-              fontSize: 18, fontWeight: 700, color: '#e2e8f0', letterSpacing: 1.5,
-              fontFamily: "'JetBrains Mono', monospace",
-              animation: 'vela-pulse 2s ease-in-out infinite',
-            }}>
-              CONNECTION LOST
-            </div>
-            <div style={{
-              fontSize: 14, color: '#94a3b8', marginTop: 12,
-              fontFamily: "'JetBrains Mono', monospace",
-            }}>
-              Reconnecting to session {sessionId}...
-            </div>
-            <div style={{
-              fontSize: 12, color: '#64748b', marginTop: 20,
-              fontFamily: "'JetBrains Mono', monospace",
-              textAlign: 'center', lineHeight: 1.6, maxWidth: 400,
-            }}>
-              Terminal content saved locally.
-              <br />
-              Your conversation will be restored when connection resumes.
-            </div>
+            {connStatus !== 'GAVE_UP' ? (
+              <>
+                <div style={{
+                  width: 44, height: 44, borderRadius: '50%',
+                  border: '3px solid rgba(255,255,255,0.1)',
+                  borderTopColor: meta.color,
+                  animation: 'vela-spin 1s linear infinite',
+                  marginBottom: 24,
+                }} />
+                <div style={{
+                  fontSize: 18, fontWeight: 700, color: '#e2e8f0', letterSpacing: 1.5,
+                  fontFamily: "'JetBrains Mono', monospace",
+                  animation: 'vela-pulse 2s ease-in-out infinite',
+                }}>
+                  CONNECTION LOST
+                </div>
+                <div style={{
+                  fontSize: 14, color: '#94a3b8', marginTop: 12,
+                  fontFamily: "'JetBrains Mono', monospace",
+                }}>
+                  Reconnecting to session {sessionId}...
+                </div>
+                <div style={{
+                  fontSize: 12, color: '#64748b', marginTop: 20,
+                  fontFamily: "'JetBrains Mono', monospace",
+                  textAlign: 'center', lineHeight: 1.6, maxWidth: 400,
+                }}>
+                  Terminal content saved locally.
+                  <br />
+                  Your conversation will be restored when connection resumes.
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={{
+                  fontSize: 32, marginBottom: 20, opacity: 0.6,
+                }}>
+                  {'\u26A0'}
+                </div>
+                <div style={{
+                  fontSize: 18, fontWeight: 700, color: '#e2e8f0', letterSpacing: 1.5,
+                  fontFamily: "'JetBrains Mono', monospace",
+                }}>
+                  SESSION UNREACHABLE
+                </div>
+                <div style={{
+                  fontSize: 14, color: '#94a3b8', marginTop: 12,
+                  fontFamily: "'JetBrains Mono', monospace",
+                  textAlign: 'center', lineHeight: 1.6, maxWidth: 420,
+                }}>
+                  Could not reconnect to session {sessionId}.
+                  <br />
+                  The backend may have restarted or the session expired.
+                </div>
+                <div style={{ display: 'flex', gap: 12, marginTop: 24 }}>
+                  <button
+                    onClick={handleManualRetry}
+                    style={{
+                      fontSize: 13, fontWeight: 700, letterSpacing: 0.5,
+                      padding: '8px 20px', borderRadius: 20, cursor: 'pointer',
+                      background: `${meta.color}22`, color: meta.color,
+                      border: `1px solid ${meta.color}55`,
+                      fontFamily: "'JetBrains Mono', monospace",
+                    }}
+                  >
+                    Retry Connection
+                  </button>
+                  <button
+                    onClick={() => window.close()}
+                    style={{
+                      fontSize: 13, fontWeight: 700, letterSpacing: 0.5,
+                      padding: '8px 20px', borderRadius: 20, cursor: 'pointer',
+                      background: 'rgba(100,116,139,0.15)', color: '#94a3b8',
+                      border: '1px solid rgba(100,116,139,0.3)',
+                      fontFamily: "'JetBrains Mono', monospace",
+                    }}
+                  >
+                    Close Tab
+                  </button>
+                </div>
+                <div style={{
+                  fontSize: 12, color: '#64748b', marginTop: 20,
+                  fontFamily: "'JetBrains Mono', monospace",
+                }}>
+                  Terminal content saved locally.
+                </div>
+              </>
+            )}
           </div>
         )}
       </div>

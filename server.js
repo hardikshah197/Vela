@@ -578,7 +578,7 @@ function scheduleOrphanCleanup(session, sessionId) {
   }, ORPHAN_TIMEOUT_MS);
 }
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 6100;
 server.listen(PORT, () => {
   console.log(`[Vela] Running on port ${PORT}`);
   console.log(`[Vela] Search roots: ${SEARCH_ROOTS.join(', ')}`);

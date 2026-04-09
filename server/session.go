@@ -20,6 +20,12 @@ const (
 	orphanTimeout   = 10 * time.Minute // 10 minutes
 )
 
+// wsMsg wraps a WebSocket message with its type
+type wsMsg struct {
+	data []byte
+	text bool // true = TextMessage, false = BinaryMessage
+}
+
 // Session represents a terminal session
 type Session struct {
 	mu             sync.Mutex
@@ -32,7 +38,7 @@ type Session struct {
 	orphanTimer    *time.Timer
 	cwd            string
 	agent          string
-	writeCh        chan []byte // serialized writes to WebSocket
+	writeCh        chan wsMsg // serialized writes to WebSocket
 	doneCh         chan struct{}
 	writeErr       bool // set when WebSocket write fails
 }
@@ -62,23 +68,36 @@ func (s *Session) kill() {
 	}
 }
 
-// wsSend safely sends data through the write channel
+// wsSend safely sends binary data through the write channel
 func (s *Session) wsSend(data []byte) {
 	select {
-	case s.writeCh <- data:
+	case s.writeCh <- wsMsg{data: data}:
 	case <-time.After(5 * time.Second):
 		log.Printf("[Vela] Write channel full, dropping data (%d bytes)", len(data))
 	}
 }
 
+// sendControl sends a JSON control message as TextMessage through the write channel
+func (s *Session) sendControl(data []byte) {
+	select {
+	case s.writeCh <- wsMsg{data: data, text: true}:
+	case <-time.After(5 * time.Second):
+		log.Printf("[Vela] Write channel full, dropping control message")
+	}
+}
+
 // wsWriter drains the write channel and sends to WebSocket
 func (s *Session) wsWriter() {
-	for data := range s.writeCh {
+	for msg := range s.writeCh {
 		s.mu.Lock()
 		ws := s.ws
 		s.mu.Unlock()
 		if ws != nil {
-			if err := ws.WriteMessage(websocket.BinaryMessage, data); err != nil {
+			msgType := websocket.BinaryMessage
+			if msg.text {
+				msgType = websocket.TextMessage
+			}
+			if err := ws.WriteMessage(msgType, msg.data); err != nil {
 				log.Printf("[Vela] WebSocket write error: %v", err)
 				s.mu.Lock()
 				s.writeErr = true
@@ -178,7 +197,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			// If previous wsWriter exited due to write error, restart it
 			if s.writeErr {
 				s.writeErr = false
-				s.writeCh = make(chan []byte, 4096)
+				s.writeCh = make(chan wsMsg, 4096)
 				go s.wsWriter()
 			} else {
 				// Drain stale data from writeCh to avoid sending old buffered
@@ -241,7 +260,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	session := &Session{
 		cwd:     cwd,
 		agent:   agent,
-		writeCh: make(chan []byte, 4096),
+		writeCh: make(chan wsMsg, 4096),
 		doneCh:  make(chan struct{}),
 	}
 	sessions.Store(sessionId, session)
@@ -258,11 +277,13 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		errMsg := fmt.Sprintf("\r\n\x1b[31mFailed to start %s: %v\x1b[0m\r\n", agent, err)
 		session.wsSend([]byte(errMsg))
-		session.wsSend([]byte(`{"__vela":"spawn_failed"}`))
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 		close(session.writeCh)
 		session.mu.Lock()
 		if session.ws != nil {
+			// Send spawn_failed as TextMessage so the client detects it as a control message
+			session.ws.WriteMessage(websocket.TextMessage, []byte(`{"__vela":"spawn_failed"}`))
+			time.Sleep(300 * time.Millisecond)
 			session.ws.WriteMessage(websocket.CloseMessage,
 				websocket.FormatCloseMessage(4000, "spawn_failed"))
 			session.ws.Close()

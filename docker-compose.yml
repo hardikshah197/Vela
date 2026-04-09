@@ -5,8 +5,8 @@ services:
     build: .
     container_name: vela
     ports:
-      - "3001:3001"
-      - "5173:5173"
+      - "6100:6100"
+      - "6001:6001"
     volumes:
       # Mount your project directories
       - ${HOME}/Desktop:/workspace

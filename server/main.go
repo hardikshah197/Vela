@@ -20,12 +20,13 @@ import (
 
 // --- Global mutable config ---
 var (
-	cfgMu       sync.RWMutex
-	searchRoots []string
-	cloneDir    string
-	loginShell  string
-	shellEnv    []string
-	distDir     string
+	cfgMu         sync.RWMutex
+	searchRoots   []string
+	cloneDir      string
+	loginShell    string
+	shellEnv      []string
+	distDir       string
+	screenshotDir string
 )
 
 // --- Sessions ---
@@ -85,9 +86,11 @@ func main() {
 	shellEnv = buildShellEnv(shellPath)
 	distDir = resolveDistDir()
 
+	screenshotDir = detectScreenshotDir()
+
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "3001"
+		port = "6100"
 	}
 
 	mux := http.NewServeMux()
@@ -116,6 +119,8 @@ func main() {
 	log.Printf("[Vela] Running on port %s", port)
 	log.Printf("[Vela] Search roots: %s", strings.Join(searchRoots, ", "))
 	log.Printf("[Vela] Serving static from: %s", distDir)
+	log.Printf("[Vela] Watching screenshots in: %s", screenshotDir)
+	go watchScreenshots()
 
 	if err := server.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("[Vela] Server error: %v", err)
@@ -194,6 +199,97 @@ func buildShellEnv(shellPath string) []string {
 	env = append(env, "TERM=xterm-256color")
 	env = append(env, "FORCE_COLOR=1")
 	return env
+}
+
+func detectScreenshotDir() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "defaults", "read", "com.apple.screencapture", "location").Output()
+	if err == nil {
+		dir := strings.TrimSpace(string(out))
+		if dir != "" {
+			if strings.HasPrefix(dir, "~") {
+				home := os.Getenv("HOME")
+				dir = filepath.Join(home, dir[1:])
+			}
+			if info, err := os.Stat(dir); err == nil && info.IsDir() {
+				return dir
+			}
+		}
+	}
+	home := os.Getenv("HOME")
+	return filepath.Join(home, "Desktop")
+}
+
+func isScreenshotFile(name string) bool {
+	lower := strings.ToLower(name)
+	if !strings.HasSuffix(lower, ".png") && !strings.HasSuffix(lower, ".jpg") && !strings.HasSuffix(lower, ".jpeg") {
+		return false
+	}
+	return strings.HasPrefix(lower, "screenshot") ||
+		strings.HasPrefix(lower, "screen shot") ||
+		strings.HasPrefix(lower, "cleanshot")
+}
+
+func watchScreenshots() {
+	dir := screenshotDir
+	seen := map[string]bool{}
+
+	// Initialize with current files to avoid detecting existing screenshots
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if !e.IsDir() && isScreenshotFile(e.Name()) {
+			seen[e.Name()] = true
+		}
+	}
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if !isScreenshotFile(name) {
+				continue
+			}
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			if time.Since(info.ModTime()) > 10*time.Second {
+				continue
+			}
+
+			fullPath := filepath.Join(dir, name)
+			log.Printf("[Vela] Screenshot detected: %s", fullPath)
+			broadcastScreenshot(fullPath)
+		}
+	}
+}
+
+func broadcastScreenshot(path string) {
+	msg, _ := json.Marshal(map[string]string{
+		"__vela": "screenshot",
+		"path":   path,
+	})
+
+	sessions.Range(func(key, value any) bool {
+		s := value.(*Session)
+		s.sendControl(msg)
+		return true
+	})
 }
 
 func resolveDistDir() string {

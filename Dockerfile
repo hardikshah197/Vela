@@ -31,7 +31,7 @@ COPY --from=go-builder /vela-server ./vela-server
 # Copy frontend build
 COPY --from=frontend-builder /build/dist ./dist
 
-EXPOSE 3001
+EXPOSE 6100
 
 ENV VELA_SEARCH_ROOTS=/workspace
 ENV VELA_CLONE_DIR=/workspace/cloned

@@ -63,6 +63,7 @@ const AGENT_ARGS = {
     { id: "exec-policy", label: "--approval-policy auto-edit", desc: "Auto-approve file edits" },
   ],
   ralph: [],
+  bash: [],
 };
 
 const STATUS_COLORS = {
@@ -76,6 +77,7 @@ const AGENT_META = {
   claude: { color: "#f97316", glow: "rgba(249,115,22,0.2)", icon: "\u25C6", brand: "Claude Code" },
   codex: { color: "#8b5cf6", glow: "rgba(139,92,246,0.2)", icon: "\u2B21", brand: "OpenAI Codex" },
   ralph: { color: "#06b6d4", glow: "rgba(6,182,212,0.2)", icon: "\u21BB", brand: "Ralph Loop" },
+  bash: { color: "#22c55e", glow: "rgba(34,197,94,0.2)", icon: "\u276F", brand: "Shell" },
 };
 
 function generateId() {
@@ -89,12 +91,34 @@ function getRelativeTime(date) {
   return `${Math.floor(diff / 3600000)}h ago`;
 }
 
+function getCommonParent(paths) {
+  if (paths.length === 0) return "";
+  if (paths.length === 1) return paths[0];
+  const parts = paths.map(p => p.split("/"));
+  const common = [];
+  for (let i = 0; i < parts[0].length; i++) {
+    const segment = parts[0][i];
+    if (parts.every(p => p[i] === segment)) {
+      common.push(segment);
+    } else break;
+  }
+  return common.join("/") || "/";
+}
+
 function openTerminalTab(ws) {
-  const args = ws.args.join(",");
-  const cwd = ws.path || "";
-  let url = `/terminal.html?agent=${ws.agent}&args=${encodeURIComponent(args)}&name=${encodeURIComponent(ws.name)}&id=${ws.id}&cwd=${encodeURIComponent(cwd)}`;
-  if (ws.agent === "ralph") {
-    url += `&loopCount=${ws.loopCount || 20}&donePrompt=${encodeURIComponent(ws.donePrompt || "")}`;
+  const services = ws.services || [];
+  const primary = services[0] || { id: "default", name: ws.name, agent: ws.agent || "claude", args: ws.args || [] };
+  const allPaths = services.map(s => s.path).filter(Boolean);
+  // Use common parent directory so the agent has context of all projects
+  const cwd = allPaths.length > 1 ? getCommonParent(allPaths) : (allPaths[0] || ws.path || "");
+  const args = (primary.args || []).join(",");
+  const sessionId = ws.id;
+  let url = `/terminal.html?agent=${primary.agent}&args=${encodeURIComponent(args)}&name=${encodeURIComponent(ws.name)}&id=${sessionId}&cwd=${encodeURIComponent(cwd)}`;
+  if (primary.agent === "ralph") {
+    url += `&loopCount=${primary.loopCount || 20}&donePrompt=${encodeURIComponent(primary.donePrompt || "")}`;
+  }
+  if (primary.agent === "bash" && primary.command) {
+    url += `&command=${encodeURIComponent(primary.command)}`;
   }
   window.open(url, "_blank");
 }
@@ -109,9 +133,10 @@ function StatusBadge({ status }) {
   );
 }
 
-function WorkspaceCard({ ws, onTerminate, onResume, onDelete, onManageSessions, tc }) {
-  const meta = AGENT_META[ws.agent];
+function WorkspaceCard({ ws, onTerminate, onResume, onDelete, onManageSessions, onAddService, tc }) {
   const [hovered, setHovered] = useState(false);
+  const services = ws.services || [];
+  const primaryMeta = AGENT_META[services[0]?.agent] || AGENT_META.claude;
 
   return (
     <div
@@ -133,10 +158,13 @@ function WorkspaceCard({ ws, onTerminate, onResume, onDelete, onManageSessions, 
 
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 9, minWidth: 0 }}>
-          <span style={{ fontSize: 16, color: tc.accent, flexShrink: 0 }}>{meta.icon}</span>
+          <span style={{ fontSize: 16, color: tc.accent, flexShrink: 0 }}>{primaryMeta.icon}</span>
           <div style={{ minWidth: 0 }}>
             <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 14, color: "#f1f5f9", letterSpacing: 0.3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{ws.name}</div>
-            <div style={{ fontSize: 10, color: "#64748b", fontFamily: "monospace", marginTop: 1 }}>{ws.id} {"\u00B7"} {getRelativeTime(ws.createdAt)}</div>
+            <div style={{ fontSize: 10, color: "#64748b", fontFamily: "monospace", marginTop: 1 }}>
+              {ws.id} {"\u00B7"} {getRelativeTime(ws.createdAt)}
+              {services.length > 1 && <> {"\u00B7"} {services.length} projects</>}
+            </div>
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
@@ -144,28 +172,17 @@ function WorkspaceCard({ ws, onTerminate, onResume, onDelete, onManageSessions, 
         </div>
       </div>
 
-      {ws.path && <div style={{ fontSize: 10, color: "#334155", fontFamily: "monospace", marginBottom: 10, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{ws.path}</div>}
-
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 14 }}>
-        <span style={{
-          background: hexToRgba(tc.accent, 0.09),
-          color: tc.accent,
-          border: `1px solid ${hexToRgba(tc.accent, 0.2)}`,
-          padding: "2px 9px",
-          borderRadius: 20,
-          fontSize: 10,
-          fontFamily: "monospace",
-          fontWeight: 600,
-          letterSpacing: 0.3,
-        }}>{meta.brand}</span>
-        {ws.agent === "ralph" ? (
-          <>
-            <span style={{ background: "rgba(6,182,212,0.1)", border: "1px solid rgba(6,182,212,0.25)", color: "#06b6d4", padding: "2px 7px", borderRadius: 4, fontSize: 9, fontFamily: "monospace" }}>
-              {ws.loopCount || 20} iter
-            </span>
-          </>
-        ) : ws.args.length > 0 && ws.args.map(a => (
-          <span key={a} style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#94a3b8", padding: "2px 7px", borderRadius: 4, fontSize: 9, fontFamily: "monospace", maxWidth: 150, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{a}</span>
+      {/* Project paths */}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 12 }}>
+        {services.map(svc => (
+          <span key={svc.id} style={{
+            fontSize: 9, fontFamily: "monospace", color: "#64748b",
+            background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)",
+            padding: "3px 8px", borderRadius: 4, maxWidth: "100%",
+            whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+          }}>
+            {svc.path ? svc.path.split("/").pop() : svc.name}
+          </span>
         ))}
       </div>
 
@@ -186,7 +203,16 @@ function WorkspaceCard({ ws, onTerminate, onResume, onDelete, onManageSessions, 
         >
           {ws.status === "stopped" ? "Stopped" : <>Connect {"\u2197"}</>}
         </button>
-        {ws.agent === "claude" && ws.path && (
+        {ws.status !== "stopped" && (
+          <button
+            onClick={() => onAddService(ws.id)}
+            style={{ ...btnStyle, background: "rgba(255,255,255,0.04)", color: "#64748b", border: "1px dashed rgba(255,255,255,0.12)" }}
+            title="Add project"
+          >
+            +
+          </button>
+        )}
+        {ws.services?.some(s => s.agent === "claude") && services[0]?.path && (
           <button onClick={() => onManageSessions(ws)} style={{ ...btnStyle, background: hexToRgba(tc.accent, 0.08), color: tc.accent, border: `1px solid ${hexToRgba(tc.accent, 0.2)}` }} title="Manage sessions">
             {"\u21CB"}
           </button>
@@ -220,74 +246,70 @@ const btnStyle = {
   letterSpacing: 0.3,
 };
 
-const API_BASE = window.__VELA_API_BASE__ || (window.location.port === "5173" ? "http://localhost:3001" : "");
+const API_BASE = window.__VELA_API_BASE__ || (window.location.port === "6001" ? "http://localhost:6100" : "");
 
-function CreateModal({ onClose, onCreate, settings }) {
-  const [name, setName] = useState("");
-  const [project, setProject] = useState("");
-  const [agent, setAgent] = useState("claude");
-  const [selectedArgs, setSelectedArgs] = useState([]);
-  const [step, setStep] = useState(1); // 1 = form, 2 = launching
-  const [loopCount, setLoopCount] = useState(20);
-  const [donePrompt, setDonePrompt] = useState("");
-  const args = AGENT_ARGS[agent];
+const svcLabelStyle = { display: "block", fontSize: 10, fontFamily: "monospace", letterSpacing: 1.5, color: "#475569", fontWeight: 700, marginBottom: 6 };
+const svcInputStyle = {
+  width: "100%", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)",
+  borderRadius: 6, padding: "8px 12px", color: "#f1f5f9", fontFamily: "monospace",
+  fontSize: 12, outline: "none", boxSizing: "border-box",
+};
 
-  // Project resolution state
-  const [projectStatus, setProjectStatus] = useState(null);
-  // null | 'checking' | 'local' | 'not-found' | 'searching-github' | 'github-found' | 'forking' | 'cloned' | 'fork-error'
-  const [projectPath, setProjectPath] = useState(null);
+function ServiceEditor({ svc, onChange, onRemove, canRemove, defaultDir }) {
+  const meta = AGENT_META[svc.agent] || AGENT_META.claude;
+  const args = AGENT_ARGS[svc.agent] || [];
+  const [expanded, setExpanded] = useState(svc._expanded !== false);
+  const [projectQuery, setProjectQuery] = useState(svc._projectQuery || "");
+  const [resolveStatus, setResolveStatus] = useState(svc.path ? "resolved" : null);
+  // null | 'checking' | 'found' | 'searching-github' | 'github-found' | 'not-found' | 'forking' | 'cloned' | 'resolved'
   const [localMatches, setLocalMatches] = useState([]);
-  const [searchRoots, setSearchRoots] = useState([]);
   const [githubResults, setGithubResults] = useState([]);
-  const [forkError, setForkError] = useState("");
 
-  // Debounced project resolution — driven by `project` field
   useEffect(() => {
-    if (!project.trim()) {
-      setProjectStatus(null);
-      setProjectPath(null);
+    if (!projectQuery.trim()) {
+      setResolveStatus(null);
       setLocalMatches([]);
       setGithubResults([]);
-      setForkError("");
       return;
     }
-
-    setProjectStatus("checking");
+    setResolveStatus("checking");
     const timer = setTimeout(async () => {
       try {
-        const res = await fetch(`${API_BASE}/api/resolve-project?name=${encodeURIComponent(project.trim())}`);
+        const res = await fetch(`${API_BASE}/api/resolve-project?name=${encodeURIComponent(projectQuery.trim())}`);
         const data = await res.json();
-
         if (data.found) {
-          setProjectStatus("local");
-          setProjectPath(data.path);
+          setResolveStatus("found");
           setLocalMatches(data.allMatches || [data.path]);
+          setGithubResults([]);
+          onChange({ ...svc, path: data.path, _projectQuery: projectQuery });
         } else {
-          setSearchRoots(data.searchRoots || []);
-          setProjectStatus("searching-github");
-
-          const ghRes = await fetch(`${API_BASE}/api/github-search?name=${encodeURIComponent(project.trim())}`);
-          const ghData = await ghRes.json();
-
-          if (ghData.results?.length > 0) {
-            setProjectStatus("github-found");
-            setGithubResults(ghData.results);
-          } else {
-            setProjectStatus("not-found");
+          // Not found locally — search GitHub
+          setResolveStatus("searching-github");
+          setLocalMatches([]);
+          try {
+            const ghRes = await fetch(`${API_BASE}/api/github-search?name=${encodeURIComponent(projectQuery.trim())}`);
+            const ghData = await ghRes.json();
+            if (ghData.results?.length > 0) {
+              setResolveStatus("github-found");
+              setGithubResults(ghData.results);
+            } else {
+              setResolveStatus("not-found");
+              setGithubResults([]);
+            }
+          } catch {
+            setResolveStatus("not-found");
             setGithubResults([]);
           }
         }
       } catch {
-        setProjectStatus(null);
+        setResolveStatus(null);
       }
-    }, 600);
-
+    }, 500);
     return () => clearTimeout(timer);
-  }, [project]);
+  }, [projectQuery]);
 
   async function handleForkClone(repoFullName) {
-    setProjectStatus("forking");
-    setForkError("");
+    setResolveStatus("forking");
     try {
       const res = await fetch(`${API_BASE}/api/fork-clone`, {
         method: "POST",
@@ -295,209 +317,311 @@ function CreateModal({ onClose, onCreate, settings }) {
         body: JSON.stringify({ repoFullName }),
       });
       const data = await res.json();
-
       if (data.success) {
-        setProjectStatus("cloned");
-        setProjectPath(data.path);
+        setResolveStatus("cloned");
         setGithubResults([]);
+        onChange({ ...svc, path: data.path, _projectQuery: projectQuery });
       } else {
-        setProjectStatus("fork-error");
-        setForkError(data.error || "Fork/clone failed");
+        setResolveStatus("not-found");
       }
     } catch {
-      setProjectStatus("fork-error");
-      setForkError("Network error");
+      setResolveStatus("not-found");
     }
   }
 
   function toggleArg(id) {
-    setSelectedArgs(prev => prev.includes(id) ? prev.filter(a => a !== id) : [...prev, id]);
+    const next = svc.selectedArgs.includes(id) ? svc.selectedArgs.filter(a => a !== id) : [...svc.selectedArgs, id];
+    onChange({ ...svc, selectedArgs: next });
   }
 
-  function handleAgentChange(a) {
-    setAgent(a);
-    setSelectedArgs([]);
-    if (a !== "ralph") {
-      setLoopCount(20);
-      setDonePrompt("");
-    }
+  return (
+    <div style={{
+      background: "rgba(255,255,255,0.02)",
+      border: "1px solid rgba(255,255,255,0.08)",
+      borderRadius: 10, padding: "14px 16px", marginBottom: 8,
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: expanded ? 14 : 0 }}>
+        <span style={{ fontSize: 14, color: meta.color }}>{meta.icon}</span>
+        <input
+          value={svc.name}
+          onChange={e => onChange({ ...svc, name: e.target.value })}
+          placeholder="Service name"
+          style={{
+            flex: 1, background: "transparent", border: "none",
+            color: "#f1f5f9", fontFamily: "monospace", fontSize: 13, fontWeight: 600,
+            outline: "none", padding: 0,
+          }}
+        />
+        <button onClick={() => setExpanded(!expanded)} style={{ background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 12, fontFamily: "monospace" }}>
+          {expanded ? "\u25B2" : "\u25BC"}
+        </button>
+        {canRemove && (
+          <button onClick={onRemove} style={{ background: "none", border: "none", color: "#ef4444", cursor: "pointer", fontSize: 14, padding: "0 2px" }}>
+            {"\u2715"}
+          </button>
+        )}
+      </div>
+
+      {expanded && (
+        <>
+          {/* Project */}
+          <div style={{ marginBottom: 12 }}>
+            <label style={svcLabelStyle}>PROJECT <span style={{ color: "#334155", fontWeight: 400 }}>(search or paste path)</span></label>
+            <input
+              value={projectQuery}
+              onChange={e => setProjectQuery(e.target.value)}
+              placeholder="e.g. my-app, /path/to/project"
+              style={svcInputStyle}
+            />
+            {resolveStatus === "checking" && (
+              <div style={{ fontSize: 10, color: "#60a5fa", fontFamily: "monospace", marginTop: 4 }}>
+                <span style={{ display: "inline-block", animation: "spin 1s linear infinite" }}>{"\u27F3"}</span> Searching...
+              </div>
+            )}
+            {resolveStatus === "found" && localMatches.length <= 1 && (
+              <div style={{ fontSize: 10, color: "#4ade80", fontFamily: "monospace", marginTop: 4 }}>
+                {"\u2713"} {svc.path}
+              </div>
+            )}
+            {resolveStatus === "found" && localMatches.length > 1 && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 3, marginTop: 6, maxHeight: 100, overflowY: "auto" }}>
+                {localMatches.map(p => (
+                  <button
+                    key={p}
+                    onClick={() => { onChange({ ...svc, path: p }); setLocalMatches([p]); }}
+                    style={{
+                      background: p === svc.path ? "rgba(34,197,94,0.1)" : "rgba(255,255,255,0.025)",
+                      border: `1px solid ${p === svc.path ? "rgba(34,197,94,0.3)" : "rgba(255,255,255,0.06)"}`,
+                      borderRadius: 4, padding: "5px 10px", cursor: "pointer",
+                      fontFamily: "monospace", fontSize: 10, color: p === svc.path ? "#4ade80" : "#94a3b8",
+                      textAlign: "left",
+                    }}
+                  >
+                    {p === svc.path && "\u2713 "}{p}
+                  </button>
+                ))}
+              </div>
+            )}
+            {resolveStatus === "searching-github" && (
+              <div style={{ fontSize: 10, color: "#60a5fa", fontFamily: "monospace", marginTop: 4 }}>
+                <span style={{ display: "inline-block", animation: "spin 1s linear infinite" }}>{"\u27F3"}</span> Not found locally. Searching GitHub...
+              </div>
+            )}
+            {resolveStatus === "forking" && (
+              <div style={{ fontSize: 10, color: "#fb923c", fontFamily: "monospace", marginTop: 4 }}>
+                <span style={{ display: "inline-block", animation: "spin 1s linear infinite" }}>{"\u27F3"}</span> Forking & cloning...
+              </div>
+            )}
+            {resolveStatus === "cloned" && (
+              <div style={{ fontSize: 10, color: "#4ade80", fontFamily: "monospace", marginTop: 4 }}>
+                {"\u2713"} Cloned to {svc.path}
+              </div>
+            )}
+            {resolveStatus === "github-found" && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 3, marginTop: 6, maxHeight: 120, overflowY: "auto" }}>
+                <div style={{ fontSize: 10, color: "#fbbf24", fontFamily: "monospace", marginBottom: 2 }}>Not found locally. Found on GitHub:</div>
+                {githubResults.map(repo => {
+                  const srcColor = repo.source === "personal" ? "#22c55e" : repo.source?.startsWith("org:") ? "#3b82f6" : "#64748b";
+                  const srcLabel = repo.source === "personal" ? "you" : repo.source?.startsWith("org:") ? repo.source.slice(4) : "global";
+                  return (
+                    <div key={repo.fullName} style={{
+                      display: "flex", alignItems: "center", justifyContent: "space-between",
+                      background: "rgba(255,255,255,0.025)", border: "1px solid rgba(255,255,255,0.06)",
+                      borderRadius: 4, padding: "5px 10px",
+                    }}>
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <span style={{ fontFamily: "monospace", fontSize: 10, color: "#94a3b8", fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{repo.fullName}</span>
+                          <span style={{ fontSize: 8, fontFamily: "monospace", color: srcColor, background: srcColor + "18", border: `1px solid ${srcColor}30`, padding: "0 4px", borderRadius: 8, flexShrink: 0 }}>{srcLabel}</span>
+                        </div>
+                        {repo.description && <div style={{ fontSize: 9, color: "#475569", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{repo.description}</div>}
+                      </div>
+                      <button
+                        onClick={() => handleForkClone(repo.fullName)}
+                        style={{
+                          background: "rgba(34,197,94,0.1)", border: "1px solid rgba(34,197,94,0.25)",
+                          color: "#4ade80", padding: "3px 8px", borderRadius: 4,
+                          fontFamily: "monospace", fontSize: 9, fontWeight: 600,
+                          cursor: "pointer", whiteSpace: "nowrap", marginLeft: 8,
+                        }}
+                      >
+                        Fork & Clone
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            {resolveStatus === "not-found" && (
+              <div style={{ fontSize: 10, color: "#fbbf24", fontFamily: "monospace", marginTop: 4 }}>
+                Not found locally or on GitHub.
+                {defaultDir && (
+                  <button
+                    onClick={() => { onChange({ ...svc, path: defaultDir }); setResolveStatus("resolved"); }}
+                    style={{ background: "none", border: "none", color: "#60a5fa", cursor: "pointer", fontFamily: "monospace", fontSize: 10, marginLeft: 6 }}
+                  >
+                    Use default: {defaultDir}
+                  </button>
+                )}
+              </div>
+            )}
+            {!projectQuery.trim() && !svc.path && defaultDir && (
+              <div style={{ fontSize: 10, color: "#60a5fa", fontFamily: "monospace", marginTop: 4 }}>
+                {"\u2139"} Will use default: {defaultDir}
+              </div>
+            )}
+          </div>
+
+          {/* Agent type */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 6, marginBottom: 12 }}>
+            {["claude", "codex", "ralph", "bash"].map(a => {
+              const m = AGENT_META[a];
+              const active = svc.agent === a;
+              return (
+                <button
+                  key={a}
+                  onClick={() => onChange({ ...svc, agent: a, selectedArgs: [], command: a === "bash" ? (svc.command || "") : undefined })}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 6,
+                    background: active ? m.color + "18" : "rgba(255,255,255,0.03)",
+                    border: `1px solid ${active ? m.color + "55" : "rgba(255,255,255,0.08)"}`,
+                    borderRadius: 6, padding: "8px 10px", cursor: "pointer",
+                    transition: "all 0.15s",
+                  }}
+                >
+                  <span style={{ fontSize: 13, color: m.color }}>{m.icon}</span>
+                  <span style={{ fontFamily: "monospace", fontWeight: 600, color: active ? m.color : "#94a3b8", fontSize: 11 }}>{m.brand}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Shell command input */}
+          {svc.agent === "bash" && (
+            <div style={{ marginBottom: 12 }}>
+              <label style={svcLabelStyle}>COMMAND</label>
+              <input
+                value={svc.command || ""}
+                onChange={e => onChange({ ...svc, command: e.target.value })}
+                placeholder="e.g. npm run dev, python server.py"
+                style={svcInputStyle}
+              />
+            </div>
+          )}
+
+          {/* Ralph config */}
+          {svc.agent === "ralph" && (
+            <div style={{ marginBottom: 12 }}>
+              <label style={svcLabelStyle}>LOOP COUNT</label>
+              <input
+                type="number" min="1" max="200"
+                value={svc.loopCount || 20}
+                onChange={e => onChange({ ...svc, loopCount: Math.max(1, parseInt(e.target.value) || 1) })}
+                style={svcInputStyle}
+              />
+            </div>
+          )}
+
+          {/* Agent args */}
+          {args.length > 0 && (
+            <div>
+              <label style={svcLabelStyle}>ARGUMENTS</label>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
+                {args.map(arg => {
+                  const active = svc.selectedArgs.includes(arg.id);
+                  return (
+                    <button
+                      key={arg.id}
+                      onClick={() => toggleArg(arg.id)}
+                      style={{
+                        display: "flex", alignItems: "center", gap: 8,
+                        background: active ? meta.color + "10" : "rgba(255,255,255,0.02)",
+                        border: `1px solid ${active ? meta.color + "40" : "rgba(255,255,255,0.06)"}`,
+                        borderRadius: 5, padding: "6px 10px", cursor: "pointer",
+                        transition: "all 0.15s", textAlign: "left",
+                      }}
+                    >
+                      <span style={{
+                        width: 14, height: 14, borderRadius: 3, border: `1.5px solid ${active ? meta.color : "#334155"}`,
+                        background: active ? meta.color : "transparent", display: "flex", alignItems: "center", justifyContent: "center",
+                        flexShrink: 0, fontSize: 9, color: "#fff",
+                      }}>
+                        {active ? "\u2713" : ""}
+                      </span>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontFamily: "monospace", fontSize: 11, color: active ? meta.color : "#94a3b8", fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{arg.label}</div>
+                        <div style={{ fontSize: 9, color: "#475569", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{arg.desc}</div>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function CreateModal({ onClose, onCreate, settings }) {
+  const [name, setName] = useState("");
+  const [services, setServices] = useState([
+    { id: generateId(), name: "Claude Code", agent: "claude", selectedArgs: [], _expanded: true },
+  ]);
+  const [step, setStep] = useState(1); // 1 = form, 2 = launching
+
+  function updateService(id, updated) {
+    setServices(prev => prev.map(s => s.id === id ? updated : s));
+  }
+
+  function removeService(id) {
+    setServices(prev => prev.filter(s => s.id !== id));
+  }
+
+  function addService() {
+    setServices(prev => [...prev, {
+      id: generateId(), name: `Service ${prev.length + 1}`, agent: "bash", selectedArgs: [], command: "", _expanded: true,
+    }]);
   }
 
   function handleCreate() {
     if (!name.trim()) return;
-    if (agent === "ralph" && (!loopCount || loopCount < 1)) return;
+    if (services.length === 0) return;
     setStep(2);
     setTimeout(() => {
-      const argLabels = selectedArgs.map(id => args.find(a => a.id === id)?.label).filter(Boolean);
-      const wsData = { name: name.trim(), agent, args: argLabels, path: projectPath || settings?.defaultCodebaseDir || "" };
-      if (agent === "ralph") {
-        wsData.loopCount = loopCount;
-        wsData.donePrompt = donePrompt.trim();
-      }
-      onCreate(wsData);
+      const defaultPath = settings?.defaultCodebaseDir || "";
+      const builtServices = services.map(svc => {
+        const agentArgs = AGENT_ARGS[svc.agent] || [];
+        const built = {
+          id: svc.id,
+          name: svc.name || AGENT_META[svc.agent]?.brand || svc.agent,
+          agent: svc.agent,
+          args: svc.selectedArgs.map(id => agentArgs.find(a => a.id === id)?.label).filter(Boolean),
+          path: svc.path || defaultPath,
+        };
+        if (svc.agent === "ralph") {
+          built.loopCount = svc.loopCount || 20;
+          built.donePrompt = (svc.donePrompt || "").trim();
+        }
+        if (svc.agent === "bash" && svc.command) {
+          built.command = svc.command;
+          built.args = ["-c", svc.command];
+        }
+        return built;
+      });
+      onCreate({
+        name: name.trim(),
+        services: builtServices,
+      });
       onClose();
     }, 1800);
   }
 
-  const meta = AGENT_META[agent];
+  const primaryAgent = services[0]?.agent || "claude";
+  const meta = AGENT_META[primaryAgent];
 
-  function renderProjectStatus() {
-    // Show default directory hint when project field is empty
-    if (!projectStatus && !project.trim() && settings?.defaultCodebaseDir) {
-      return (
-        <div style={{ borderRadius: 8, padding: "10px 14px", marginTop: 10, fontSize: 13, fontFamily: "monospace", background: "rgba(59,130,246,0.06)", border: "1px solid rgba(59,130,246,0.15)", color: "#60a5fa" }}>
-          {"\u2139"} Will use default directory: <span style={{ color: "#94a3b8" }}>{settings.defaultCodebaseDir}</span>
-          <div style={{ fontSize: 10, color: "#475569", marginTop: 4 }}>Configure in Settings {"\u2699"}</div>
-        </div>
-      );
-    }
-    if (!projectStatus) return null;
 
-    const statusBox = {
-      borderRadius: 8,
-      padding: "10px 14px",
-      marginTop: 10,
-      fontSize: 13,
-      fontFamily: "monospace",
-    };
-
-    if (projectStatus === "checking" || projectStatus === "searching-github") {
-      return (
-        <div style={{ ...statusBox, background: "rgba(59,130,246,0.08)", border: "1px solid rgba(59,130,246,0.2)", color: "#60a5fa" }}>
-          <span style={{ display: "inline-block", animation: "spin 1s linear infinite", marginRight: 8 }}>{"\u27F3"}</span>
-          {projectStatus === "checking" ? "Checking local projects..." : "Not found locally. Searching GitHub..."}
-        </div>
-      );
-    }
-
-    if (projectStatus === "local") {
-      if (localMatches.length <= 1) {
-        return (
-          <div style={{ ...statusBox, background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.2)", color: "#4ade80" }}>
-            {"\u2713"} Found locally at <span style={{ color: "#94a3b8" }}>{projectPath}</span>
-          </div>
-        );
-      }
-      return (
-        <div style={{ marginTop: 10 }}>
-          <div style={{ ...statusBox, background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.2)", color: "#4ade80", marginTop: 0 }}>
-            {"\u2713"} Found {localMatches.length} matches. Select one:
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 8, maxHeight: 150, overflowY: "auto" }}>
-            {localMatches.map(p => (
-              <button
-                key={p}
-                onClick={() => { setProjectPath(p); setLocalMatches([p]); }}
-                style={{
-                  display: "flex", alignItems: "center",
-                  background: p === projectPath ? "rgba(34,197,94,0.1)" : "rgba(255,255,255,0.025)",
-                  border: `1px solid ${p === projectPath ? "rgba(34,197,94,0.3)" : "rgba(255,255,255,0.06)"}`,
-                  borderRadius: 6, padding: "8px 12px", cursor: "pointer",
-                  fontFamily: "monospace", fontSize: 11, color: p === projectPath ? "#4ade80" : "#94a3b8",
-                  textAlign: "left", transition: "all 0.15s",
-                }}
-              >
-                {p === projectPath && <span style={{ marginRight: 6 }}>{"\u2713"}</span>}
-                {p}
-              </button>
-            ))}
-          </div>
-        </div>
-      );
-    }
-
-    if (projectStatus === "cloned") {
-      return (
-        <div style={{ ...statusBox, background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.2)", color: "#4ade80" }}>
-          {"\u2713"} Cloned to <span style={{ color: "#94a3b8" }}>{projectPath}</span>
-        </div>
-      );
-    }
-
-    if (projectStatus === "forking") {
-      return (
-        <div style={{ ...statusBox, background: "rgba(249,115,22,0.08)", border: "1px solid rgba(249,115,22,0.2)", color: "#fb923c" }}>
-          <span style={{ display: "inline-block", animation: "spin 1s linear infinite", marginRight: 8 }}>{"\u27F3"}</span>
-          Forking & cloning...
-        </div>
-      );
-    }
-
-    if (projectStatus === "fork-error") {
-      return (
-        <div style={{ ...statusBox, background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)", color: "#f87171" }}>
-          {"\u2715"} {forkError}
-        </div>
-      );
-    }
-
-    if (projectStatus === "not-found") {
-      return (
-        <div style={{ ...statusBox, background: "rgba(245,158,11,0.08)", border: "1px solid rgba(245,158,11,0.2)", color: "#fbbf24" }}>
-          <div>Not found locally or on GitHub.</div>
-          {settings?.defaultCodebaseDir ? (
-            <button
-              onClick={() => { setProjectPath(settings.defaultCodebaseDir); setProjectStatus("local"); setLocalMatches([settings.defaultCodebaseDir]); }}
-              style={{
-                background: "rgba(59,130,246,0.1)", border: "1px solid rgba(59,130,246,0.25)",
-                color: "#60a5fa", padding: "5px 12px", borderRadius: 6, marginTop: 8,
-                fontFamily: "monospace", fontSize: 11, fontWeight: 600, cursor: "pointer",
-                transition: "all 0.15s",
-              }}
-            >
-              Use default: {settings.defaultCodebaseDir}
-            </button>
-          ) : (
-            <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 4 }}>Will launch in home directory.</div>
-          )}
-        </div>
-      );
-    }
-
-    if (projectStatus === "github-found") {
-      return (
-        <div style={{ marginTop: 10 }}>
-          <div style={{ ...statusBox, background: "rgba(245,158,11,0.08)", border: "1px solid rgba(245,158,11,0.2)", color: "#fbbf24", marginTop: 0 }}>
-            Not found locally. Found on GitHub:
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 8, maxHeight: 180, overflowY: "auto" }}>
-            {githubResults.map(repo => (
-              <div key={repo.fullName} style={{
-                display: "flex", alignItems: "center", justifyContent: "space-between",
-                background: "rgba(255,255,255,0.025)", border: "1px solid rgba(255,255,255,0.06)",
-                borderRadius: 6, padding: "8px 12px",
-              }}>
-                <div style={{ minWidth: 0, flex: 1 }}>
-                  <div style={{ fontFamily: "monospace", fontSize: 11, color: "#94a3b8", fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                    {repo.fullName}
-                  </div>
-                  {repo.description && (
-                    <div style={{ fontSize: 10, color: "#475569", marginTop: 2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                      {repo.description}
-                    </div>
-                  )}
-                </div>
-                <button
-                  onClick={() => handleForkClone(repo.fullName)}
-                  style={{
-                    background: "rgba(34,197,94,0.1)", border: "1px solid rgba(34,197,94,0.25)",
-                    color: "#4ade80", padding: "4px 10px", borderRadius: 5,
-                    fontFamily: "monospace", fontSize: 10, fontWeight: 600,
-                    cursor: "pointer", whiteSpace: "nowrap", marginLeft: 10,
-                    transition: "all 0.15s",
-                  }}
-                >
-                  Fork & Clone
-                </button>
-              </div>
-            ))}
-          </div>
-        </div>
-      );
-    }
-
-    return null;
-  }
 
   return (
     <div style={{
@@ -520,8 +644,7 @@ function CreateModal({ onClose, onCreate, settings }) {
             <div style={{ fontSize: 40, marginBottom: 16, animation: "spin 1s linear infinite", display: "inline-block" }}>{"\u27F3"}</div>
             <div style={{ fontFamily: "monospace", color: "#4ade80", fontSize: 14, letterSpacing: 1 }}>INITIALIZING SESSION</div>
             <div style={{ color: "#475569", fontSize: 12, marginTop: 8, fontFamily: "monospace" }}>
-              Spawning terminal for <span style={{ color: meta.color }}>{name}</span>
-              {projectPath && <> in <span style={{ color: "#94a3b8" }}>{projectPath}</span></>}...
+              Spawning {services.length} service{services.length > 1 ? "s" : ""} for <span style={{ color: meta.color }}>{name}</span>...
             </div>
           </div>
         ) : (
@@ -553,157 +676,42 @@ function CreateModal({ onClose, onCreate, settings }) {
                 />
               </div>
 
-              {/* Project Directory */}
+              {/* Services */}
               <div style={{ marginBottom: 18 }}>
-                <label style={labelStyle}>PROJECT <span style={{ color: "#334155", fontWeight: 400 }}>(optional {"\u2014"} leave empty for default directory)</span></label>
-                <input
-                  value={project}
-                  onChange={e => setProject(e.target.value)}
-                  placeholder="e.g. my-app, JIRA-1234, owner/repo"
+                <label style={labelStyle}>SERVICES</label>
+                {services.map(svc => (
+                  <ServiceEditor
+                    key={svc.id}
+                    svc={svc}
+                    onChange={updated => updateService(svc.id, updated)}
+                    onRemove={() => removeService(svc.id)}
+                    canRemove={services.length > 1}
+                    defaultDir={settings?.defaultCodebaseDir || ""}
+                  />
+                ))}
+                <button
+                  onClick={addService}
                   style={{
-                    width: "100%", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)",
-                    borderRadius: 8, padding: "10px 14px", color: "#f1f5f9", fontFamily: "monospace",
-                    fontSize: 14, outline: "none", boxSizing: "border-box",
-                    transition: "border-color 0.15s",
+                    width: "100%", padding: "10px", borderRadius: 8,
+                    background: "rgba(255,255,255,0.02)",
+                    border: "1px dashed rgba(255,255,255,0.12)",
+                    color: "#64748b", fontFamily: "monospace", fontWeight: 600,
+                    fontSize: 12, cursor: "pointer", transition: "all 0.15s",
                   }}
-                />
-                {renderProjectStatus()}
+                >
+                  + Add Another Service
+                </button>
               </div>
-
-              {/* Agent */}
-              <div style={{ marginBottom: 20 }}>
-                <label style={labelStyle}>AGENT TYPE</label>
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
-                  {["claude", "codex", "ralph"].map(a => {
-                    const m = AGENT_META[a];
-                    const active = agent === a;
-                    const desc = a === "claude" ? "Anthropic CLI" : a === "codex" ? "OpenAI CLI" : "Autonomous Loop";
-                    return (
-                      <button
-                        key={a}
-                        onClick={() => handleAgentChange(a)}
-                        style={{
-                          display: "flex", alignItems: "center", gap: 12,
-                          background: active ? m.color + "18" : "rgba(255,255,255,0.03)",
-                          border: `1px solid ${active ? m.color + "55" : "rgba(255,255,255,0.08)"}`,
-                          borderRadius: 8, padding: "12px 16px", cursor: "pointer",
-                          transition: "all 0.15s", textAlign: "left",
-                        }}
-                      >
-                        <span style={{ fontSize: 20, color: m.color }}>{m.icon}</span>
-                        <div>
-                          <div style={{ fontFamily: "monospace", fontWeight: 700, color: active ? m.color : "#94a3b8", fontSize: 14 }}>{m.brand}</div>
-                          <div style={{ fontSize: 11, color: "#475569", fontFamily: "monospace" }}>
-                            {desc}
-                          </div>
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {/* Ralph Loop config or Arguments */}
-              {agent === "ralph" ? (
-                <div style={{ marginBottom: 22 }}>
-                  <div style={{ marginBottom: 16 }}>
-                    <label style={labelStyle}>LOOP COUNT</label>
-                    <input
-                      type="number"
-                      min="1"
-                      max="200"
-                      value={loopCount}
-                      onChange={e => setLoopCount(Math.max(1, parseInt(e.target.value) || 1))}
-                      style={{
-                        width: "100%", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)",
-                        borderRadius: 8, padding: "10px 14px", color: "#f1f5f9", fontFamily: "monospace",
-                        fontSize: 14, outline: "none", boxSizing: "border-box",
-                        transition: "border-color 0.15s",
-                      }}
-                    />
-                    <div style={{ fontSize: 10, color: "#475569", fontFamily: "monospace", marginTop: 4 }}>
-                      Max iterations before stopping (each gets a fresh context window)
-                    </div>
-                  </div>
-                  <div>
-                    <label style={labelStyle}>DONE PROMPT <span style={{ color: "#334155", fontWeight: 400 }}>(optional)</span></label>
-                    <textarea
-                      value={donePrompt}
-                      onChange={e => setDonePrompt(e.target.value)}
-                      placeholder={"e.g. Build a REST API for todos.\n\nWhen complete:\n- All CRUD endpoints working\n- Tests passing\n\nOutput: <promise>COMPLETE</promise>"}
-                      rows={5}
-                      style={{
-                        width: "100%", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)",
-                        borderRadius: 8, padding: "10px 14px", color: "#f1f5f9", fontFamily: "monospace",
-                        fontSize: 13, outline: "none", boxSizing: "border-box", resize: "vertical",
-                        transition: "border-color 0.15s", lineHeight: 1.5,
-                      }}
-                    />
-                    <div style={{ fontSize: 10, color: "#475569", fontFamily: "monospace", marginTop: 4 }}>
-                      Written to PROMPT.md in the project directory. Leave empty to use existing PROMPT.md.
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div style={{ marginBottom: 22 }}>
-                  <label style={labelStyle}>ARGUMENTS <span style={{ color: "#334155", fontWeight: 400 }}>(optional)</span></label>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-                    {args.map(arg => {
-                      const active = selectedArgs.includes(arg.id);
-                      return (
-                        <button
-                          key={arg.id}
-                          onClick={() => toggleArg(arg.id)}
-                          style={{
-                            display: "flex", alignItems: "center", gap: 10,
-                            background: active ? meta.color + "10" : "rgba(255,255,255,0.02)",
-                            border: `1px solid ${active ? meta.color + "40" : "rgba(255,255,255,0.06)"}`,
-                            borderRadius: 7, padding: "8px 12px", cursor: "pointer",
-                            transition: "all 0.15s", textAlign: "left",
-                          }}
-                        >
-                          <span style={{
-                            width: 16, height: 16, borderRadius: 4, border: `1.5px solid ${active ? meta.color : "#334155"}`,
-                            background: active ? meta.color : "transparent", display: "flex", alignItems: "center", justifyContent: "center",
-                            flexShrink: 0, fontSize: 10, color: "#fff", transition: "all 0.15s",
-                          }}>
-                            {active ? "\u2713" : ""}
-                          </span>
-                          <div style={{ minWidth: 0 }}>
-                            <div style={{ fontFamily: "monospace", fontSize: 12, color: active ? meta.color : "#94a3b8", fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{arg.label}</div>
-                            <div style={{ fontSize: 10, color: "#475569", marginTop: 2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{arg.desc}</div>
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-
-              {/* Command preview */}
-              {name && (
-                <div style={{ background: "rgba(0,0,0,0.4)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 8, padding: "10px 14px", marginBottom: 18 }}>
-                  <div style={{ fontSize: 11, color: "#475569", fontFamily: "monospace", marginBottom: 5, letterSpacing: 1 }}>COMMAND PREVIEW</div>
-                  <div style={{ fontFamily: "monospace", fontSize: 13, color: "#4ade80", wordBreak: "break-all" }}>
-                    {(projectPath || settings?.defaultCodebaseDir) && <><span style={{ color: "#64748b" }}>cd {projectPath || settings.defaultCodebaseDir} &&</span>{" "}</>}
-                    {agent === "ralph" ? (
-                      <>$ ~/.claude/bin/ralph.sh {loopCount}{donePrompt ? " PROMPT.md" : ""}</>
-                    ) : (
-                      <>$ {agent} {selectedArgs.map(id => args.find(a => a.id === id)?.label).filter(Boolean).join(" ")}</>
-                    )}
-                  </div>
-                </div>
-              )}
 
               <button
                 onClick={handleCreate}
-                disabled={!name.trim() || projectStatus === "forking"}
+                disabled={!name.trim()}
                 style={{
                   width: "100%", padding: "14px", borderRadius: 10,
-                  background: name.trim() && projectStatus !== "forking" ? meta.color : "rgba(255,255,255,0.05)",
+                  background: name.trim() ? meta.color : "rgba(255,255,255,0.05)",
                   border: "none", color: name.trim() ? "#fff" : "#334155",
                   fontFamily: "monospace", fontWeight: 700, fontSize: 15,
-                  cursor: name.trim() && projectStatus !== "forking" ? "pointer" : "not-allowed",
+                  cursor: name.trim() ? "pointer" : "not-allowed",
                   letterSpacing: 1, transition: "all 0.2s",
                   boxShadow: name.trim() ? `0 0 20px ${meta.glow}` : "none",
                 }}
@@ -722,6 +730,70 @@ const labelStyle = {
   display: "block", fontSize: 12, fontFamily: "monospace", letterSpacing: 1.5,
   color: "#475569", fontWeight: 700, marginBottom: 8,
 };
+
+function AddServiceModal({ onClose, onAdd, defaultDir }) {
+  const [svc, setSvc] = useState({
+    id: generateId(), name: "", agent: "bash", selectedArgs: [], command: "", _expanded: true,
+  });
+
+  function handleAdd() {
+    const agentArgs = AGENT_ARGS[svc.agent] || [];
+    const built = {
+      id: svc.id,
+      name: svc.name || AGENT_META[svc.agent]?.brand || svc.agent,
+      agent: svc.agent,
+      args: svc.selectedArgs.map(id => agentArgs.find(a => a.id === id)?.label).filter(Boolean),
+      path: svc.path || defaultDir || "",
+    };
+    if (svc.agent === "bash" && svc.command) {
+      built.command = svc.command;
+      built.args = ["-c", svc.command];
+    }
+    if (svc.agent === "ralph") {
+      built.loopCount = svc.loopCount || 20;
+    }
+    onAdd(built);
+  }
+
+  const meta = AGENT_META[svc.agent];
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", backdropFilter: "blur(8px)",
+      display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100,
+      animation: "fadeIn 0.2s ease",
+    }}>
+      <div style={{
+        background: "#0f1117", border: "1px solid rgba(255,255,255,0.12)",
+        borderRadius: 16, width: "min(520px, 90vw)", maxHeight: "80vh", overflow: "auto",
+        boxShadow: "0 40px 80px rgba(0,0,0,0.8)", animation: "slideUp 0.25s ease",
+      }}>
+        <div style={{ padding: "22px 24px 0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 18, color: "#f1f5f9" }}>Add Service</div>
+            <div style={{ color: "#475569", fontSize: 12, fontFamily: "monospace", marginTop: 2 }}>Add a new service to this workspace</div>
+          </div>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: "#475569", fontSize: 20, cursor: "pointer" }}>{"\u2715"}</button>
+        </div>
+        <div style={{ padding: "18px 24px 24px" }}>
+          <ServiceEditor svc={svc} onChange={setSvc} onRemove={() => {}} canRemove={false} defaultDir={defaultDir} />
+          <button
+            onClick={handleAdd}
+            style={{
+              width: "100%", padding: "12px", borderRadius: 8, marginTop: 8,
+              background: meta.color, border: "none", color: "#fff",
+              fontFamily: "monospace", fontWeight: 700, fontSize: 14,
+              cursor: "pointer", letterSpacing: 0.5, transition: "all 0.2s",
+              boxShadow: `0 0 16px ${meta.glow}`,
+            }}
+          >
+            Add Service
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function SettingsModal({ settings, onClose, onSave }) {
   const [defaultDir, setDefaultDir] = useState(settings?.defaultCodebaseDir || "");
@@ -1068,9 +1140,13 @@ function SessionManagerModal({ workspace, onClose, onImport, onTakeOver, workspa
     } else if (onImport) {
       onImport({
         name: session.projectName,
-        agent: "claude",
-        args: ["--dangerously-skip-permissions", "--resume"],
         path: session.cwd,
+        services: [{
+          id: generateId(),
+          name: "Claude Code",
+          agent: "claude",
+          args: ["--dangerously-skip-permissions", "--resume"],
+        }],
       });
     }
     onClose();
@@ -1212,8 +1288,35 @@ function SessionManagerModal({ workspace, onClose, onImport, onTakeOver, workspa
           )}
 
           {/* External sessions */}
-          <div style={{ fontSize: 11, color: "#64748b", fontFamily: "monospace", letterSpacing: 1, fontWeight: 700, marginBottom: 10 }}>
-            EXTERNAL SESSIONS {!loading && `(${externalSessions.length})`}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <div style={{ fontSize: 11, color: "#64748b", fontFamily: "monospace", letterSpacing: 1, fontWeight: 700 }}>
+              EXTERNAL SESSIONS {!loading && `(${externalSessions.length})`}
+            </div>
+            {externalSessions.length > 1 && (
+              <button
+                onClick={async () => {
+                  if (!confirm(`Kill all ${externalSessions.length} external sessions?`)) return;
+                  for (const s of externalSessions) {
+                    try {
+                      await fetch(`${API_BASE}/api/kill-process`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ pid: s.pid }),
+                      });
+                    } catch {}
+                  }
+                  setTimeout(fetchSessions, 1000);
+                }}
+                style={{
+                  background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.25)",
+                  color: "#ef4444", padding: "4px 12px", borderRadius: 5,
+                  fontFamily: "monospace", fontSize: 10, fontWeight: 700,
+                  cursor: "pointer", letterSpacing: 0.3,
+                }}
+              >
+                Kill All
+              </button>
+            )}
           </div>
 
           {loading ? (
@@ -1354,17 +1457,52 @@ function SessionManagerModal({ workspace, onClose, onImport, onTakeOver, workspa
   );
 }
 
+// Track whether the initial load succeeded to prevent data destruction
+let _loadedFromStorage = false;
+
 function loadWorkspaces() {
   try {
     const saved = localStorage.getItem("vela-workspaces");
-    if (saved) return JSON.parse(saved);
-  } catch {}
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (!Array.isArray(parsed)) return [];
+      const result = parsed.map(ws => {
+        // Migrate old format: single agent/args → services array
+        if (!ws.services) {
+          const svc = {
+            id: generateId(),
+            name: AGENT_META[ws.agent]?.brand || ws.agent || "Agent",
+            agent: ws.agent || "claude",
+            args: ws.args || [],
+          };
+          if (ws.agent === "ralph") {
+            svc.loopCount = ws.loopCount;
+            svc.donePrompt = ws.donePrompt;
+          }
+          return { ...ws, services: [svc] };
+        }
+        return ws;
+      });
+      _loadedFromStorage = result.length > 0;
+      return result;
+    }
+  } catch (e) {
+    console.error("[Vela] Failed to load workspaces from localStorage:", e);
+    // Don't return [] here — we'll mark _loadedFromStorage as false
+    // so saveWorkspaces won't overwrite whatever is in storage
+  }
   return [];
 }
 
 function saveWorkspaces(workspaces) {
   try {
+    // Prevent saving empty array if we failed to load — avoids wiping real data
+    if (workspaces.length === 0 && !_loadedFromStorage) {
+      const existing = localStorage.getItem("vela-workspaces");
+      if (existing && existing !== "[]") return;
+    }
     localStorage.setItem("vela-workspaces", JSON.stringify(workspaces));
+    _loadedFromStorage = true;
   } catch {}
 }
 
@@ -1391,6 +1529,61 @@ export default function App() {
   useEffect(() => {
     saveWorkspaces(workspaces);
   }, [workspaces]);
+
+  // Reconcile workspace status with backend after system sleep / tab restore
+  useEffect(() => {
+    let lastHidden = 0;
+
+    async function reconcileSessions() {
+      try {
+        const res = await fetch(`${API_BASE}/api/sessions`);
+        if (!res.ok) return;
+        const { sessions: alive } = await res.json();
+        const aliveIds = new Set(alive.filter(s => s.alive).map(s => s.id));
+
+        setWorkspaces(prev => {
+          let changed = false;
+          const next = prev.map(w => {
+            if (w.status === "running" && !aliveIds.has(w.id)) {
+              changed = true;
+              return { ...w, status: "stopped" };
+            }
+            return w;
+          });
+          return changed ? next : prev;
+        });
+      } catch {
+        // Backend unreachable — mark all running as stopped
+        setWorkspaces(prev => {
+          let changed = false;
+          const next = prev.map(w => {
+            if (w.status === "running") {
+              changed = true;
+              return { ...w, status: "stopped" };
+            }
+            return w;
+          });
+          return changed ? next : prev;
+        });
+      }
+    }
+
+    function onVisibilityChange() {
+      if (document.hidden) {
+        lastHidden = Date.now();
+      } else {
+        // Only reconcile if we were hidden for >30 seconds (likely sleep or long background)
+        if (lastHidden && Date.now() - lastHidden > 30_000) {
+          reconcileSessions();
+        }
+      }
+    }
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    // Also reconcile once on mount (handles page refresh after sleep)
+    reconcileSessions();
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, []);
 
   // Seed settings from server on first load
   useEffect(() => {
@@ -1430,6 +1623,12 @@ export default function App() {
   }
 
   function handleTerminate(id) {
+    // Kill the backend PTY session
+    fetch(`${API_BASE}/api/kill-session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: id }),
+    }).catch(() => {});
     setWorkspaces(prev => prev.map(w => w.id === id ? { ...w, status: "stopped" } : w));
   }
 
@@ -1438,22 +1637,40 @@ export default function App() {
   }
 
   function handleDelete(id) {
+    // Kill backend session before removing from list
+    fetch(`${API_BASE}/api/kill-session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: id }),
+    }).catch(() => {});
     setWorkspaces(prev => prev.filter(w => w.id !== id));
   }
 
   function handleTakeOver(ws, externalSession) {
-    // Update workspace to use --resume and mark as running
     const updatedArgs = ["--dangerously-skip-permissions", "--resume"];
+    const updatedServices = (ws.services || []).map((s, i) =>
+      i === 0 ? { ...s, args: updatedArgs } : s
+    );
     setWorkspaces(prev => prev.map(w =>
-      w.id === ws.id ? { ...w, args: updatedArgs, status: "running" } : w
+      w.id === ws.id ? { ...w, services: updatedServices, status: "running" } : w
     ));
-    // Open terminal tab with --resume (old session was killed by the modal)
-    openTerminalTab({ ...ws, args: updatedArgs });
+    openTerminalTab({ ...ws, services: updatedServices });
+  }
+
+  const [addServiceTarget, setAddServiceTarget] = useState(null); // workspace id for inline add
+
+  function handleAddService(wsId) {
+    setAddServiceTarget(wsId);
   }
 
   const tc = getThemeColors(settings?.theme);
 
-  const filtered = workspaces.filter(w => filter === "all" || w.status === filter || w.agent === filter);
+  const filtered = workspaces.filter(w => {
+    if (filter === "all") return true;
+    if (filter === "running" || filter === "idle" || filter === "stopped") return w.status === filter;
+    // Agent type filter — match if any service uses that agent
+    return w.services?.some(s => s.agent === filter);
+  });
 
   const counts = {
     running: workspaces.filter(w => w.status === "running").length,
@@ -1620,6 +1837,7 @@ export default function App() {
                   onResume={handleResume}
                   onDelete={handleDelete}
                   onManageSessions={setSessionManagerTarget}
+                  onAddService={handleAddService}
                   tc={tc}
                 />
               ))}
@@ -1633,6 +1851,19 @@ export default function App() {
           onClose={() => setShowCreate(false)}
           onCreate={handleCreate}
           settings={settings}
+        />
+      )}
+
+      {addServiceTarget && (
+        <AddServiceModal
+          onClose={() => setAddServiceTarget(null)}
+          defaultDir={settings?.defaultCodebaseDir || ""}
+          onAdd={(svc) => {
+            setWorkspaces(prev => prev.map(w =>
+              w.id === addServiceTarget ? { ...w, services: [...(w.services || []), svc] } : w
+            ));
+            setAddServiceTarget(null);
+          }}
         />
       )}
 

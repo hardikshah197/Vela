@@ -44,10 +44,14 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 		handleDetectSessions(w, r)
 	case path == "/api/kill-process" && method == "POST":
 		handleKillProcess(w, r)
+	case path == "/api/sessions" && method == "GET":
+		handleListSessions(w, r)
 	case path == "/api/kill-session" && method == "POST":
 		handleKillSession(w, r)
 	case path == "/api/upload" && method == "POST":
 		handleUpload(w, r)
+	case path == "/api/file-preview" && method == "GET":
+		handleFilePreview(w, r)
 	default:
 		sendJSON(w, map[string]string{"error": "Not found"}, 404)
 	}
@@ -159,6 +163,7 @@ func handleResolveProject(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/github-search?name=...
+// Tiered search: personal repos → org repos → global
 func handleGitHubSearch(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
 	if name == "" {
@@ -166,20 +171,107 @@ func handleGitHubSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "gh", "search", "repos", name, "--json", "fullName,url,description", "--limit", "8")
-	cmd.Env = shellEnv
-	out, err := cmd.Output()
-	if err != nil {
-		sendJSON(w, map[string]any{"results": []any{}, "error": "gh CLI not available or not authenticated"}, 200)
-		return
+
+	type repoResult struct {
+		FullName    string `json:"fullName"`
+		Description string `json:"description"`
+		Source      string `json:"source"` // "personal", "org:<name>", "global"
 	}
 
-	var results []any
-	if err := json.Unmarshal(out, &results); err != nil {
-		sendJSON(w, map[string]any{"results": []any{}}, 200)
-		return
+	// 1. Get authenticated user's login
+	userOut, _ := exec.CommandContext(ctx, "gh", "api", "/user", "--jq", ".login").Output()
+	username := strings.TrimSpace(string(userOut))
+	if username == "" {
+		username = "hardikshah197"
+	}
+
+	// 2. Get user's orgs
+	orgsOut, _ := exec.CommandContext(ctx, "gh", "api", "/user/orgs", "--jq", ".[].login").Output()
+	var orgs []string
+	for _, o := range strings.Split(strings.TrimSpace(string(orgsOut)), "\n") {
+		o = strings.TrimSpace(o)
+		if o != "" {
+			orgs = append(orgs, o)
+		}
+	}
+
+	// 3. Search in parallel: personal + each org + global
+	type searchResult struct {
+		repos  []repoResult
+		source string
+	}
+
+	numSearches := 1 + len(orgs) + 1 // personal + orgs + global
+	ch := make(chan searchResult, numSearches)
+
+	// Helper to run a gh search
+	ghSearch := func(owner, source string, limit int) {
+		args := []string{"search", "repos", name, "--json", "fullName,description", "--limit", strconv.Itoa(limit)}
+		if owner != "" {
+			args = append(args, "--owner", owner)
+		}
+		cmd := exec.CommandContext(ctx, "gh", args...)
+		cmd.Env = shellEnv
+		out, err := cmd.Output()
+		if err != nil {
+			ch <- searchResult{source: source}
+			return
+		}
+		var parsed []struct {
+			FullName    string `json:"fullName"`
+			Description string `json:"description"`
+		}
+		json.Unmarshal(out, &parsed)
+		repos := make([]repoResult, len(parsed))
+		for i, p := range parsed {
+			repos[i] = repoResult{FullName: p.FullName, Description: p.Description, Source: source}
+		}
+		ch <- searchResult{repos: repos, source: source}
+	}
+
+	// Personal
+	go ghSearch(username, "personal", 5)
+	// Orgs
+	for _, org := range orgs {
+		go ghSearch(org, "org:"+org, 5)
+	}
+	// Global
+	go ghSearch("", "global", 8)
+
+	// 4. Collect results in order: personal → orgs → global
+	resultMap := map[string][]repoResult{}
+	for i := 0; i < numSearches; i++ {
+		sr := <-ch
+		resultMap[sr.source] = sr.repos
+	}
+
+	seen := map[string]bool{}
+	var results []repoResult
+
+	// Personal first
+	for _, r := range resultMap["personal"] {
+		if !seen[r.FullName] {
+			seen[r.FullName] = true
+			results = append(results, r)
+		}
+	}
+	// Then orgs
+	for _, org := range orgs {
+		for _, r := range resultMap["org:"+org] {
+			if !seen[r.FullName] {
+				seen[r.FullName] = true
+				results = append(results, r)
+			}
+		}
+	}
+	// Then global
+	for _, r := range resultMap["global"] {
+		if !seen[r.FullName] {
+			seen[r.FullName] = true
+			results = append(results, r)
+		}
 	}
 
 	sendJSON(w, map[string]any{"results": results}, 200)
@@ -395,13 +487,48 @@ func handleKillProcess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := syscall.Kill(req.Pid, syscall.SIGTERM); err != nil {
-		sendJSON(w, map[string]any{"success": false, "error": err.Error()}, 500)
-		return
+	// Kill the entire process group to ensure child processes are also terminated
+	// Try SIGTERM first, then SIGKILL after a brief delay
+	syscall.Kill(-req.Pid, syscall.SIGTERM)
+	syscall.Kill(req.Pid, syscall.SIGTERM)
+	go func() {
+		time.Sleep(2 * time.Second)
+		syscall.Kill(-req.Pid, syscall.SIGKILL)
+		syscall.Kill(req.Pid, syscall.SIGKILL)
+	}()
+
+	log.Printf("[Vela] Killed external process group: %d", req.Pid)
+	sendJSON(w, map[string]any{"success": true}, 200)
+}
+
+// GET /api/sessions — list active backend sessions for frontend reconciliation
+func handleListSessions(w http.ResponseWriter, r *http.Request) {
+	type sessionInfo struct {
+		ID    string `json:"id"`
+		Agent string `json:"agent"`
+		Cwd   string `json:"cwd"`
+		Alive bool   `json:"alive"`
 	}
 
-	log.Printf("[Vela] Killed external process: %d", req.Pid)
-	sendJSON(w, map[string]any{"success": true}, 200)
+	var results []sessionInfo
+	sessions.Range(func(key, value any) bool {
+		s := value.(*Session)
+		s.mu.Lock()
+		alive := !s.dead && s.cmd != nil
+		results = append(results, sessionInfo{
+			ID:    key.(string),
+			Agent: s.agent,
+			Cwd:   s.cwd,
+			Alive: alive,
+		})
+		s.mu.Unlock()
+		return true
+	})
+
+	if results == nil {
+		results = []sessionInfo{}
+	}
+	sendJSON(w, map[string]any{"sessions": results}, 200)
 }
 
 // POST /api/kill-session
@@ -435,14 +562,15 @@ func handleKillSession(w http.ResponseWriter, r *http.Request) {
 		s.orphanTimer.Stop()
 	}
 	if s.cmd != nil && s.cmd.Process != nil {
-		s.cmd.Process.Kill()
+		// Kill the entire process group, not just the direct process
+		syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
 	}
 	if s.ptyFile != nil {
 		s.ptyFile.Close()
 	}
 	if s.ws != nil {
 		s.ws.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(4000, "killed"), )
+			websocket.FormatCloseMessage(4000, "killed"))
 		s.ws.Close()
 	}
 	s.mu.Unlock()
@@ -499,6 +627,56 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[Vela] Upload: %s (%d bytes)", filePath, len(decoded))
 	sendJSON(w, map[string]any{"success": true, "path": filePath}, 200)
+}
+
+// GET /api/file-preview?path=...
+func handleFilePreview(w http.ResponseWriter, r *http.Request) {
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" {
+		http.Error(w, "path required", 400)
+		return
+	}
+
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		http.Error(w, "invalid path", 400)
+		return
+	}
+
+	// Security: only serve from screenshot dir or upload dir
+	uploadDir := filepath.Join(os.TempDir(), "vela-uploads")
+	allowed := false
+	for _, dir := range []string{screenshotDir, uploadDir} {
+		absDir, _ := filepath.Abs(dir)
+		if strings.HasPrefix(absPath, absDir+"/") {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		http.Error(w, "forbidden", 403)
+		return
+	}
+
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		http.Error(w, "not found", 404)
+		return
+	}
+
+	ext := strings.ToLower(filepath.Ext(absPath))
+	contentType := "application/octet-stream"
+	switch ext {
+	case ".png":
+		contentType = "image/png"
+	case ".jpg", ".jpeg":
+		contentType = "image/jpeg"
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.Write(data)
 }
 
 func sanitizeFilename(name string) string {
