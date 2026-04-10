@@ -105,12 +105,36 @@ function getCommonParent(paths) {
   return common.join("/") || "/";
 }
 
-function openTerminalTab(ws) {
+async function openTerminalTab(ws, onWorktreeCreated) {
   const services = ws.services || [];
   const primary = services[0] || { id: "default", name: ws.name, agent: ws.agent || "claude", args: ws.args || [] };
   const allPaths = services.map(s => s.path).filter(Boolean);
-  // Use common parent directory so the agent has context of all projects
-  const cwd = allPaths.length > 1 ? getCommonParent(allPaths) : (allPaths[0] || ws.path || "");
+  let cwd = allPaths.length > 1 ? getCommonParent(allPaths) : (allPaths[0] || ws.path || "");
+
+  // If isolated, create worktree and use its path
+  if (ws.isolated && cwd && !ws.worktreePath) {
+    try {
+      const res = await fetch(`${API_BASE}/api/worktree/create`, {
+        method: "POST",
+        headers: authHeaders({}),
+        body: JSON.stringify({ repoPath: cwd, workspaceId: ws.id, branchName: ws.name }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        cwd = data.worktreePath;
+        if (onWorktreeCreated) onWorktreeCreated(data.worktreePath, data.branchName);
+      } else {
+        alert(`Failed to create worktree: ${data.error}`);
+        return;
+      }
+    } catch (err) {
+      alert(`Failed to create worktree: ${err.message}`);
+      return;
+    }
+  } else if (ws.worktreePath) {
+    cwd = ws.worktreePath;
+  }
+
   const args = (primary.args || []).join(",");
   const sessionId = ws.id;
   let url = `/terminal.html?agent=${primary.agent}&args=${encodeURIComponent(args)}&name=${encodeURIComponent(ws.name)}&id=${sessionId}&cwd=${encodeURIComponent(cwd)}`;
@@ -135,7 +159,7 @@ function StatusBadge({ status }) {
   );
 }
 
-function WorkspaceCard({ ws, onTerminate, onResume, onDelete, onManageSessions, onAddService, tc }) {
+function WorkspaceCard({ ws, onTerminate, onResume, onDelete, onManageSessions, onAddService, onOpen, tc }) {
   const [hovered, setHovered] = useState(false);
   const services = ws.services || [];
   const primaryMeta = AGENT_META[services[0]?.agent] || AGENT_META.claude;
@@ -170,6 +194,14 @@ function WorkspaceCard({ ws, onTerminate, onResume, onDelete, onManageSessions, 
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+          {ws.isolated && (
+            <span style={{
+              fontSize: 9, fontFamily: "monospace", fontWeight: 700, letterSpacing: 0.5,
+              color: tc.accent, background: hexToRgba(tc.accent, 0.1),
+              border: `1px solid ${hexToRgba(tc.accent, 0.2)}`,
+              padding: "2px 6px", borderRadius: 4,
+            }}>ISOLATED</span>
+          )}
           <StatusBadge status={ws.status} />
         </div>
       </div>
@@ -190,7 +222,7 @@ function WorkspaceCard({ ws, onTerminate, onResume, onDelete, onManageSessions, 
 
       <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
         <button
-          onClick={() => openTerminalTab(ws)}
+          onClick={() => onOpen(ws)}
           disabled={ws.status === "stopped"}
           style={{
             display: "flex", alignItems: "center", gap: 6,
@@ -572,6 +604,8 @@ function CreateModal({ onClose, onCreate, settings }) {
     { id: generateId(), name: "Claude Code", agent: "claude", selectedArgs: [], _expanded: true },
   ]);
   const [step, setStep] = useState(1); // 1 = form, 2 = launching
+  const [isolated, setIsolated] = useState(false);
+  const tc = getThemeColors(settings?.theme);
 
   function updateService(id, updated) {
     setServices(prev => prev.map(s => s.id === id ? updated : s));
@@ -615,6 +649,7 @@ function CreateModal({ onClose, onCreate, settings }) {
       onCreate({
         name: name.trim(),
         services: builtServices,
+        isolated,
       });
       onClose();
     }, 1800);
@@ -676,6 +711,35 @@ function CreateModal({ onClose, onCreate, settings }) {
                     transition: "border-color 0.15s",
                   }}
                 />
+              </div>
+
+              {/* Isolation Toggle */}
+              <div style={{
+                display: "flex", alignItems: "center", justifyContent: "space-between",
+                padding: "10px 14px", borderRadius: 8, marginBottom: 18,
+                background: isolated ? hexToRgba(tc.accent, 0.06) : "rgba(255,255,255,0.02)",
+                border: `1px solid ${isolated ? hexToRgba(tc.accent, 0.2) : "rgba(255,255,255,0.06)"}`,
+                cursor: "pointer", transition: "all 0.2s",
+              }} onClick={() => setIsolated(!isolated)}>
+                <div>
+                  <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, fontSize: 12, color: "#e2e8f0" }}>
+                    {"\u2387"} Isolated Mode
+                  </div>
+                  <div style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b", marginTop: 2 }}>
+                    {isolated ? "Creates a git worktree \u2014 run multiple agents on the same repo" : "Run in the original project directory"}
+                  </div>
+                </div>
+                <div style={{
+                  width: 40, height: 22, borderRadius: 11, padding: 2,
+                  background: isolated ? tc.accent : "rgba(255,255,255,0.1)",
+                  transition: "background 0.2s", flexShrink: 0,
+                }}>
+                  <div style={{
+                    width: 18, height: 18, borderRadius: 9, background: "#fff",
+                    transform: isolated ? "translateX(18px)" : "translateX(0)",
+                    transition: "transform 0.2s",
+                  }} />
+                </div>
               </div>
 
               {/* Services */}
@@ -2522,12 +2586,21 @@ export default function App() {
   }
 
   function handleDelete(id) {
+    const ws = workspaces.find(w => w.id === id);
     // Kill backend session before removing from list
     fetch(`${API_BASE}/api/kill-session`, {
       method: "POST",
       headers: authHeaders({}),
       body: JSON.stringify({ sessionId: id }),
     }).catch(() => {});
+    // Clean up worktree if isolated
+    if (ws?.isolated && ws?.worktreePath) {
+      fetch(`${API_BASE}/api/worktree/remove`, {
+        method: "POST",
+        headers: authHeaders({}),
+        body: JSON.stringify({ worktreePath: ws.worktreePath, repoPath: ws.services?.[0]?.path || "" }),
+      }).catch(() => {});
+    }
     setWorkspaces(prev => prev.filter(w => w.id !== id));
   }
 
@@ -2763,6 +2836,9 @@ export default function App() {
                   onDelete={handleDelete}
                   onManageSessions={setSessionManagerTarget}
                   onAddService={handleAddService}
+                  onOpen={(w) => openTerminalTab(w, (worktreePath, branchName) => {
+                    setWorkspaces(prev => prev.map(x => x.id === w.id ? { ...x, worktreePath, branchName } : x));
+                  })}
                   tc={tc}
                 />
               ))}

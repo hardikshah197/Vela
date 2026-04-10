@@ -77,6 +77,10 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 		handleListSessions(w, r)
 	case path == "/api/kill-session" && method == "POST":
 		handleKillSession(w, r)
+	case path == "/api/worktree/create" && method == "POST":
+		handleWorktreeCreate(w, r)
+	case path == "/api/worktree/remove" && method == "POST":
+		handleWorktreeRemove(w, r)
 	case path == "/api/upload" && method == "POST":
 		handleUpload(w, r)
 	case path == "/api/file-preview" && method == "GET":

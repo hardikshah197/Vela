@@ -25,8 +25,9 @@ var (
 	cloneDir      string
 	loginShell    string
 	shellEnv      []string
-	distDir       string
-	screenshotDir string
+	distDir        string
+	screenshotDir  string
+	worktreeBaseDir string
 )
 
 // --- Sessions ---
@@ -74,6 +75,18 @@ func main() {
 
 	os.MkdirAll(cloneDir, 0755)
 
+	worktreeBaseDir = os.Getenv("VELA_WORKTREE_DIR")
+	if worktreeBaseDir == "" {
+		worktreeBaseDir = filepath.Join(os.TempDir(), "vela-worktrees")
+	}
+	os.MkdirAll(worktreeBaseDir, 0755)
+
+	// Clean stale worktrees from previous runs
+	if entries, err := os.ReadDir(worktreeBaseDir); err == nil && len(entries) > 0 {
+		log.Printf("[Vela] Cleaning %d stale worktrees from previous run", len(entries))
+		cleanupAllWorktrees()
+	}
+
 	// Extract full PATH from user's login shell
 	shellPath := os.Getenv("PATH")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -113,6 +126,7 @@ func main() {
 			s.kill()
 			return true
 		})
+		cleanupAllWorktrees()
 		server.Close()
 	}()
 
